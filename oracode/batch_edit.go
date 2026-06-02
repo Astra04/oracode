@@ -279,6 +279,21 @@ func (s *MCPServer) applyGroup(groupName string, patches []BatchPatch, opts Batc
 	var violations []string
 	if opts.ValidateAfter {
 		violations = s.runValidateOnFiles(changedFiles)
+		if len(violations) > 0 {
+			// Rollback this group because validation failed
+			for f, content := range snapshots {
+				abs, err2 := s.idx.Policy.ResolveWorkspacePath(f)
+				if err2 == nil {
+					_ = atomicWriteFile(abs, content)
+				}
+			}
+			return GroupResult{
+				Group:              groupName,
+				Applied:            false,
+				ValidateViolations: violations,
+				Error:              "Validation failed after edits. Group rolled back.",
+			}, snapshots, nil
+		}
 	}
 
 	// Cleanup imports

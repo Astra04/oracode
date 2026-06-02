@@ -37,8 +37,8 @@ func DefaultSecurityPolicy(root string) SecurityPolicy {
 			// contain schema definitions that must be indexed for
 			// scalpel_find_string, scalpel_list_tables, and
 			// scalpel_describe_table to work correctly.
-			"scratch":  true,
-			"_scratch": true,
+			//"scratch":  true,
+			//"_scratch": true,
 			"tmp":      true,
 			"uploads":  true,
 		},
