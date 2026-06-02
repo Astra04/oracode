@@ -33,6 +33,11 @@ type BatchPatch struct {
 	// "replace_symbol", "add_struct_field", "remove_struct_field",
 	// "range_replace", "create_file", "create_or_patch", "rename_file"
 	MutationType string `json:"mutation_type"`
+
+	// For vue_inject_directive
+	Tag string `json:"tag,omitempty"`
+	MatchAttr string `json:"match_attr,omitempty"`
+	Directive string `json:"directive,omitempty"`
 }
 
 // BatchEditOptions controls batch edit behaviour.
@@ -348,6 +353,33 @@ func (s *MCPServer) applyPatch(p BatchPatch, snapshots map[string][]byte) error 
 		_, err := s.ops.ReplaceSymbol(p.File, p.SymbolAnchor, p.NewContent)
 		return err
 
+		case "replace_symbol_vue":
+		if p.SymbolAnchor == "" {
+			return fmt.Errorf("replace_symbol_vue requires symbol_anchor")
+		}
+		fops := NewFrontendOps(s.idx)
+		return fops.ReplaceSymbolInVue(p.File, p.SymbolAnchor, p.NewContent)
+
+	case "add_import_vue":
+		fops := NewFrontendOps(s.idx)
+		return fops.AddImportToVue(p.File, p.NewContent)
+
+	case "add_composable_vue":
+		fops := NewFrontendOps(s.idx)
+		return fops.AddComposableToSetup(p.File, p.NewContent)
+
+	case "vue_inject_directive":
+		fops := NewFrontendOps(s.idx)
+		_, err := fops.InjectVueDirective(p.File, p.Tag, p.MatchAttr, p.Directive, false)
+		return err
+
+	case "replace_block":
+		if p.Block == "" {
+			return fmt.Errorf("replace_block requires block")
+		}
+		fops := NewFrontendOps(s.idx)
+		return fops.ReplaceBlock(p.File, p.Block, p.NewContent)
+
 	case "add_struct_field":
 		if p.SymbolAnchor == "" {
 			return fmt.Errorf("add_struct_field requires symbol_anchor")
@@ -363,19 +395,30 @@ func (s *MCPServer) applyPatch(p BatchPatch, snapshots map[string][]byte) error 
 		return err
 
 	case "range_replace":
-		if p.StartLine == 0 && p.EndLine == 0 {
+		if p.StartLine == 0 && p.EndLine == 0 && p.Block == "" {
 			return fmt.Errorf("range_replace requires start_line and end_line")
 		}
+
+		startLine := p.StartLine
+		endLine := p.EndLine
+
+		if p.Block != "" {
+			absStart, absEnd, err := ResolveBlockOffset(abs, p.Block, p.StartLine, p.EndLine)
+			if err != nil {
+				return err
+			}
+			startLine = absStart
+			endLine = absEnd
+		}
+
 		data, err := os.ReadFile(abs)
 		if err != nil {
 			return err
 		}
 		lines := strings.Split(string(data), "\n")
-		startLine := p.StartLine
 		if startLine < 1 {
 			startLine = 1
 		}
-		endLine := p.EndLine
 		if endLine > len(lines) {
 			endLine = len(lines)
 		}

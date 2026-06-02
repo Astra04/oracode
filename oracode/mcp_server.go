@@ -586,11 +586,11 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 			// ==================== PHASE 3: SURGICAL EXECUTION ====================
 			{
 				Name:        "scalpel_batch_edit",
-				Description: "Apply multiple file changes atomically with automatic rollback on build failure, returning the exact compiler error with surrounding lines for immediate repair.",
+				Description: "Apply multiple file changes atomically. Supports Vue ops (replace_symbol_vue, add_import_vue, add_composable_vue, vue_inject_directive, replace_block) and Go ops (replace_symbol, add_struct_field, range_replace, create_file). For range_replace in Vue, specifying a block (e.g. 'template') interprets lines relative to that block.",
 				InputSchema: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"patches":                     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}, "description": "List of patches (each has file, group, mutation_type, etc.)"},
+						"patches":                     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}, "description": "List of patches (file, group, mutation_type, block, start_line, end_line, new_content, symbol_anchor, tag, match_attr, directive)"},
 						"dry_run":                     map[string]string{"type": "boolean", "description": "Only preview, don't write"},
 						"atomic":                      map[string]string{"type": "boolean", "description": "Rollback all groups if any fails"},
 						"stop_on_first_group_failure": map[string]string{"type": "boolean", "description": "Stop processing groups after first failure"},
