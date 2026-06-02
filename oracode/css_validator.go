@@ -2,6 +2,7 @@ package oracode
 
 // ValidateCSS validates CSS code using a single-pass character state machine.
 // It checks for brace balancing, unclosed strings, and unclosed comments.
+// Returns violations with accurate line numbers pointing to the start of the malformed block.
 func ValidateCSS(code string, file string) []Violation {
 	var violations []Violation
 
@@ -15,7 +16,10 @@ func ValidateCSS(code string, file string) []Violation {
 	state := TopLevel
 	prevState := TopLevel
 
-	braceDepth := 0
+	var blockOpenLines []int
+	var commentOpenLine int
+	var stringOpenLine int
+
 	var stringChar byte
 	lineNum := 1
 
@@ -24,6 +28,7 @@ func ValidateCSS(code string, file string) []Violation {
 
 		if char == '\n' {
 			lineNum++
+			// Continue processing newlines so strings can catch unescaped newlines.
 		}
 
 		if state == InComment {
@@ -47,7 +52,7 @@ func ValidateCSS(code string, file string) []Violation {
 				violations = append(violations, Violation{
 					ConstraintID: "css.unclosed_string_newline",
 					Message:      "String literal spans multiple lines without escape",
-					Line:         lineNum - 1, // error happened on the previous line
+					Line:         stringOpenLine,
 				})
 				state = prevState
 				continue
@@ -62,6 +67,7 @@ func ValidateCSS(code string, file string) []Violation {
 		if char == '/' && i+1 < len(code) && code[i+1] == '*' {
 			prevState = state
 			state = InComment
+			commentOpenLine = lineNum
 			i++ // skip '*'
 			continue
 		}
@@ -69,27 +75,29 @@ func ValidateCSS(code string, file string) []Violation {
 		if char == '"' || char == '\'' {
 			prevState = state
 			state = InString
+			stringOpenLine = lineNum
 			stringChar = char
 			continue
 		}
 
 		// Block transitions
 		if char == '{' {
-			braceDepth++
+			blockOpenLines = append(blockOpenLines, lineNum)
 			if state == TopLevel {
 				state = InBlock
 			}
 		} else if char == '}' {
-			braceDepth--
-			if braceDepth < 0 {
+			if len(blockOpenLines) == 0 {
 				violations = append(violations, Violation{
 					ConstraintID: "css.unmatched_brace",
 					Message:      "Unexpected closing brace '}'",
 					Line:         lineNum,
 				})
-				braceDepth = 0 // reset to avoid cascades
-			} else if braceDepth == 0 {
-				state = TopLevel
+			} else {
+				blockOpenLines = blockOpenLines[:len(blockOpenLines)-1]
+				if len(blockOpenLines) == 0 {
+					state = TopLevel
+				}
 			}
 		}
 	}
@@ -99,19 +107,22 @@ func ValidateCSS(code string, file string) []Violation {
 		violations = append(violations, Violation{
 			ConstraintID: "css.unclosed_comment",
 			Message:      "Unclosed comment '/*'",
-			Line:         lineNum,
+			Line:         commentOpenLine,
 		})
 	} else if state == InString {
 		violations = append(violations, Violation{
 			ConstraintID: "css.unclosed_string",
 			Message:      "Unclosed string literal",
-			Line:         lineNum,
+			Line:         stringOpenLine,
 		})
-	} else if braceDepth > 0 {
+	}
+
+	// Report all unclosed braces
+	for _, openLine := range blockOpenLines {
 		violations = append(violations, Violation{
 			ConstraintID: "css.unclosed_brace",
 			Message:      "Unclosed opening brace '{'",
-			Line:         lineNum,
+			Line:         openLine,
 		})
 	}
 
