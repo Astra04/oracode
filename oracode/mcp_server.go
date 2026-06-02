@@ -1960,17 +1960,44 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 			packet.WriteString("\n")
 		}
 
-		sqlGraph, _ := LoadSQLGraph(workspaceStatePath(s.idx.Policy.WorkspaceRoot, "sql_graph.json"))
+				sqlGraph, _ := LoadSQLGraph(workspaceStatePath(s.idx.Policy.WorkspaceRoot, "sql_graph.json"))
 		if sqlGraph != nil {
 			packet.WriteString("## SQL Tables\n")
+			// Deduplicate tables by their column signatures to avoid multi-tenant bloat
+			seenSignatures := make(map[string]string) // sig -> first table name seen
+			printedCount := 0
 			for name, table := range sqlGraph.Tables {
 				if strings.EqualFold(table.Module, module) {
-					fmt.Fprintf(&packet, "- %s (%s)\n", name, table.File)
+					// Create a simple signature based on columns
+					var cols []string
+					for _, c := range table.Columns {
+						cols = append(cols, c.Name+":"+c.Type)
+					}
+					sig := strings.Join(cols, ",")
+
+					if existingTable, exists := seenSignatures[sig]; exists {
+						_ = existingTable
+					} else {
+						seenSignatures[sig] = name
+						fmt.Fprintf(&packet, "- %s (%s)\n", name, table.File)
+						printedCount++
+					}
 				}
+			}
+
+			// To output the missing message: Let's count how many tables belong to the module
+			totalModuleTables := 0
+			for _, table := range sqlGraph.Tables {
+				if strings.EqualFold(table.Module, module) {
+					totalModuleTables++
+				}
+			}
+
+			if totalModuleTables > 0 && printedCount < totalModuleTables {
+				fmt.Fprintf(&packet, "(%d identical tenant table variants omitted to save context space)\n", totalModuleTables-printedCount)
 			}
 			packet.WriteString("\n")
 		}
-
 		protoGraph, _ := LoadProtoGraph(workspaceStatePath(s.idx.Policy.WorkspaceRoot, "proto_graph.json"))
 		if protoGraph != nil {
 			packet.WriteString("## gRPC Services\n")
