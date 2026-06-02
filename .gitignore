@@ -1,0 +1,74 @@
+# ============================================
+# OraCode Project .gitignore
+# Only Go source files (*.go, go.mod, go.sum)
+# should be tracked. Everything else is build
+# artifact, tooling, or generated output.
+# ============================================
+
+# --- Go build cache & vendor ---
+.gocache/
+.gopath/
+/oracode/vendor/
+
+# --- Compiled binaries ---
+*.exe
+*.exe~
+*.test
+*.out
+*.o
+*.a
+
+# --- LLM model files (large binaries) ---
+llama-b9439-bin-win-cpu-x64/
+
+# --- DLLs & shared libraries ---
+*.dll
+*.so
+*.dylib
+
+# --- Backup / orphaned files (.*.NUMBER suffix) ---
+*.go.*
+*.bak
+*.swp
+*.swo
+*~
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# --- OS files ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# --- Environment files ---
+.env
+.env.local
+.env.*
+
+# --- OraCode internal state ---
+.oracode/
+
+# --- Tools & scripts (PowerShell, Python, JSON outputs) ---
+tools/
+
+# --- Test area (Vue test components, scratch) ---
+test_area/
+
+# --- Markdown docs (README is tracked, but keep others out) ---
+CODE_CHANGES_REFERENCE.md
+FRONTEND_TOOLS_FIX_SUMMARY.md
+deepseek_powershell_20260529_eb7672.ps1
+
+# --- Logs ---
+*.log
