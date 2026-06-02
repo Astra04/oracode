@@ -4,8 +4,8 @@ import (
 	"strings"
 )
 
-// ValidateCSS is a lightweight parser to check for unclosed braces and missing semicolons in CSS.
-// It is intended as a helper validation tool.
+// ValidateCSS uses a simple bracket scanner to check CSS for errors.
+// It is intended as a lightweight circuit breaker during batch editing.
 func ValidateCSS(code string, file string) []Violation {
 	var violations []Violation
 
@@ -14,12 +14,24 @@ func ValidateCSS(code string, file string) []Violation {
 
 	// Track whether we are inside a CSS rule block
 	for i, line := range lines {
-		clean := strings.TrimSpace(line)
-		if clean == "" {
-			continue
-		}
+		// Quick check to skip braces in strings
+		inString := false
+		var stringChar byte
 
-		for _, char := range line {
+		for j := 0; j < len(line); j++ {
+			char := line[j]
+			if inString {
+				if char == '\\' { j++; continue }
+				if char == stringChar { inString = false }
+				continue
+			}
+
+			if char == '"' || char == '\'' {
+				inString = true
+				stringChar = char
+				continue
+			}
+
 			if char == '{' {
 				braceDepth++
 			} else if char == '}' {

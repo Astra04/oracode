@@ -61,7 +61,12 @@ func BuildSQLGraph(workspaceRoot string, moduleMap map[string][]string) (*SQLGra
 			return nil
 		}
 		if strings.HasSuffix(d.Name(), ".sql") {
-			sqlFiles = append(sqlFiles, path)
+			// Ensure it's inside a 'migrations' directory
+			// Path processing: path uses filepath.Separator
+			pathLower := strings.ToLower(path)
+			if strings.Contains(pathLower, "migration") || strings.Contains(pathLower, "migrations") {
+				sqlFiles = append(sqlFiles, path)
+			}
 		}
 		return nil
 	})

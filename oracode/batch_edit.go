@@ -188,8 +188,8 @@ func (s *MCPServer) applyGroup(groupName string, patches []BatchPatch, opts Batc
 			releaseLocks(locks)
 			return GroupResult{}, nil, fmt.Errorf("resolve %s: %w", p.File, err)
 		}
-		// Create flock for the target file (not a separate .lock file)
-		fl := flock.New(abs)
+		// Create flock for the target file via a sidecar lock file to avoid VSCode editor locking conflicts
+		fl := flock.New(abs + ".oracode.lock")
 		locked, err := fl.TryLockContext(context.Background(), opts.Timeout)
 		if err != nil || !locked {
 			releaseLocks(locks)
