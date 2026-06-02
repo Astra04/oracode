@@ -37,7 +37,7 @@ func coalesceFile(file string, patches []BatchPatch) ([]BatchPatch, error) {
 
 	for _, p := range patches {
 		switch p.MutationType {
-		case "replace_symbol", "add_struct_field", "remove_struct_field":
+		case "replace_symbol", "add_struct_field", "remove_struct_field", "replace_symbol_vue", "add_import_vue", "add_composable_vue", "vue_inject_directive", "replace_block":
 			symbolPatches = append(symbolPatches, p)
 		case "create_file", "create_or_patch", "rename_file":
 			lifecyclePatches = append(lifecyclePatches, p)
