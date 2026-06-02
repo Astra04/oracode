@@ -1,6 +1,8 @@
 package oracode
 
 import (
+	"net/http"
+	"net/url"
 	"bufio"
 	"bytes"
 	"context"
@@ -213,6 +215,52 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 
 	case "tools/list":
 		tools := []mcpTool{
+
+			// ==================== WATCHDOG INTEGRATION ====================
+			{
+				Name:        "watchdog_errors",
+				Description: "Fetch runtime errors captured by the watchdog system from state.json",
+				InputSchema: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"service": map[string]string{"type": "string", "description": "Optional: 'Main API', 'TX+', 'PocketBase', 'Frontend', 'system'"},
+						"limit":   map[string]interface{}{"type": "integer", "description": "Max results (default 20)"},
+					},
+				},
+			},
+			{
+				Name:        "watchdog_state",
+				Description: "Get full system state: CPU, RAM, Disk, PG, service health, tenant telemetry",
+				InputSchema: map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+			{
+				Name:        "watchdog_supervisor",
+				Description: "Control a supervised service (start, stop, restart)",
+				InputSchema: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"service": map[string]string{"type": "string", "description": "Required: 'Main API', 'TX+', 'PocketBase', 'Frontend'"},
+						"action":  map[string]string{"type": "string", "description": "Required: 'start', 'stop', 'restart'"},
+					},
+					"required": []string{"service", "action"},
+				},
+			},
+			{
+				Name:        "watchdog_logs",
+				Description: "Get recent log lines from a supervised service",
+				InputSchema: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"service": map[string]string{"type": "string", "description": "Required: 'Main API', 'TX+', 'PocketBase', 'Frontend'"},
+						"lines":   map[string]interface{}{"type": "integer", "description": "Optional: default 200, max 2000"},
+					},
+					"required": []string{"service"},
+				},
+			},
+
 			// ==================== PHASE 1: DISCOVERY & ONBOARDING ====================
 			{
 				Name:        "scalpel_context_packet",
@@ -1425,6 +1473,60 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		}
 		out, _ := json.MarshalIndent(gap, "", "  ")
 		return textResp(req.ID, "## Schema Gap\n```json\n"+string(out)+"\n```")
+
+	// ===== WATCHDOG INTEGRATION =====
+	case "watchdog_errors":
+		service, _ := params.Arguments["service"].(string)
+		limitF, ok := params.Arguments["limit"].(float64)
+		limit := 20
+		if ok { limit = int(limitF) }
+
+		res, err := s.fetchWatchdogArtifact("errors.jsonl") // Or state.json if we parse it
+		if err != nil { return errResp(req.ID, err.Error()) }
+
+		// Very simple filter: if service is provided, we just string match for now.
+		// Alternatively, we return state.json and let the user filter.
+		// For robustness, let's just return the raw or lightly processed artifacts.
+		if service != "" {
+			lines := strings.Split(res, "\n")
+			var filtered []string
+			for _, line := range lines {
+				if strings.Contains(line, service) {
+					filtered = append(filtered, line)
+				}
+			}
+			if len(filtered) > limit { filtered = filtered[:limit] }
+			return textResp(req.ID, strings.Join(filtered, "\n"))
+		}
+
+		lines := strings.Split(res, "\n")
+		if len(lines) > limit { lines = lines[:limit] }
+		return textResp(req.ID, strings.Join(lines, "\n"))
+
+	case "watchdog_state":
+		res, err := s.fetchWatchdogArtifact("state.json")
+		if err != nil { return errResp(req.ID, err.Error()) }
+		return textResp(req.ID, res)
+
+	case "watchdog_supervisor":
+		service, _ := params.Arguments["service"].(string)
+		action, _ := params.Arguments["action"].(string)
+		if service == "" || action == "" { return errResp(req.ID, "service and action required") }
+
+		res, err := s.postWatchdogSupervisor(service, action)
+		if err != nil { return errResp(req.ID, err.Error()) }
+		return textResp(req.ID, res)
+
+	case "watchdog_logs":
+		service, _ := params.Arguments["service"].(string)
+		linesF, ok := params.Arguments["lines"].(float64)
+		lines := 200
+		if ok { lines = int(linesF) }
+		if service == "" { return errResp(req.ID, "service required") }
+
+		res, err := s.fetchWatchdogLogs(service, lines)
+		if err != nil { return errResp(req.ID, err.Error()) }
+		return textResp(req.ID, res)
 
 	case "scalpel_trace_error":
 		ref, _ := params.Arguments["ref"].(string)
@@ -3880,4 +3982,34 @@ func extractBindingSurface(vueSource []byte) string {
 		out = append(out, v)
 	}
 	return strings.Join(out, ", ")
+}
+
+// --- Watchdog Helpers ---
+func (s *MCPServer) fetchWatchdogArtifact(artifact string) (string, error) {
+	resp, err := http.Get(fmt.Sprintf("http://localhost:9191/artifacts/%s", artifact))
+	if err != nil { return "", fmt.Errorf("watchdog API error: %w", err) }
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil { return "", err }
+	return string(b), nil
+}
+
+func (s *MCPServer) postWatchdogSupervisor(service, action string) (string, error) {
+	req, err := http.NewRequest("POST", fmt.Sprintf("http://localhost:9191/api/supervisor/%s/%s", url.PathEscape(service), action), nil)
+	if err != nil { return "", err }
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { return "", fmt.Errorf("watchdog API error: %w", err) }
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil { return "", err }
+	return string(b), nil
+}
+
+func (s *MCPServer) fetchWatchdogLogs(service string, lines int) (string, error) {
+	resp, err := http.Get(fmt.Sprintf("http://localhost:9191/api/logs?service=%s&lines=%d", url.QueryEscape(service), lines))
+	if err != nil { return "", fmt.Errorf("watchdog API error: %w", err) }
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil { return "", err }
+	return string(b), nil
 }
