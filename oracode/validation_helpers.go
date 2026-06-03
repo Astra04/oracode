@@ -58,6 +58,19 @@ func (s *MCPServer) runValidateOnFiles(files map[string]bool) []string {
 					}
 				}
 			}
+
+
+		}
+
+		// 3. Tree-sitter syntax check for JS/TS/Vue
+		if ok && (lang == LanguageTypeScript || lang == LanguageJavaScript || lang == LanguageTSX || lang == LanguageVue) {
+			cst, err := s.idx.Pool.ParseFile(abs, lang, s.idx.Policy)
+			if err == nil {
+				if cst.HasError() {
+					violations = append(violations, fmt.Sprintf("%s: syntax error detected by parser", file))
+				}
+				cst.Release()
+			}
 		}
 	}
 	return violations
