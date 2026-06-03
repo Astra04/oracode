@@ -1,6 +1,7 @@
 package oracode
 
 import (
+	"github.com/odvcencio/gotreesitter"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -58,8 +59,6 @@ func (s *MCPServer) runValidateOnFiles(files map[string]bool) []string {
 					}
 				}
 			}
-
-
 		}
 
 		// 3. Tree-sitter syntax check for JS/TS/Vue
@@ -67,7 +66,27 @@ func (s *MCPServer) runValidateOnFiles(files map[string]bool) []string {
 			cst, err := s.idx.Pool.ParseFile(abs, lang, s.idx.Policy)
 			if err == nil {
 				if cst.HasError() {
-					violations = append(violations, fmt.Sprintf("%s: syntax error detected by parser", file))
+					// Walk the tree to find the first ERROR node to report line numbers
+					root := cst.Tree.RootNode()
+					if root != nil {
+						var walk func(n *gotreesitter.Node)
+						walk = func(n *gotreesitter.Node) {
+							if n.Type(cst.Tree.Language()) == "ERROR" {
+								startByte := n.StartByte()
+								if startByte > uint32(len(src)) {
+									startByte = uint32(len(src))
+								}
+								line := strings.Count(string(src[:startByte]), "\n") + 1
+								violations = append(violations, fmt.Sprintf("%s:%d syntax error detected by parser", file, line))
+							}
+							for i := 0; i < n.ChildCount(); i++ {
+								walk(n.Child(i))
+							}
+						}
+						walk(root)
+					} else {
+						violations = append(violations, fmt.Sprintf("%s: syntax error detected by parser", file))
+					}
 				}
 				cst.Release()
 			}
