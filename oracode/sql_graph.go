@@ -64,7 +64,7 @@ func BuildSQLGraph(workspaceRoot string, moduleMap map[string][]string) (*SQLGra
 			// Ensure it's inside a 'migrations' directory
 			// Path processing: path uses filepath.Separator
 			pathLower := strings.ToLower(path)
-			if strings.Contains(pathLower, "migration") || strings.Contains(pathLower, "migrations") {
+			if strings.Contains(pathLower, "migration") || strings.Contains(pathLower, "schema") {
 				sqlFiles = append(sqlFiles, path)
 			}
 		}
@@ -243,6 +243,7 @@ func GetTableModule(tableName string) string {
 	// Accounting / GL
 	if strings.HasPrefix(name, "gl_") ||
 		strings.HasPrefix(name, "accounting_") ||
+		strings.Contains(name, "shareholder") ||
 		strings.HasPrefix(name, "journal_") ||
 		strings.HasPrefix(name, "bank_") ||
 		strings.HasPrefix(name, "cost_centre") ||
