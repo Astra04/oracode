@@ -1385,6 +1385,22 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		if err != nil {
 			return errResp(req.ID, err.Error())
 		}
+
+		if strings.Contains(text, "No matches found for") && file == "" && langFilter == "" {
+			// Fallback to semantic search so the tool call doesn't go to waste
+			if s.semanticEngine != nil {
+				semResults, semErr := s.semanticEngine.HybridSearch(query, limit, "code")
+				if semErr == nil && len(semResults) > 0 {
+					var out strings.Builder
+					fmt.Fprintf(&out, "## No exact string matches found. Falling back to Semantic Search Results:\n\n")
+					for _, doc := range semResults {
+						fmt.Fprintf(&out, "### `%s`\n**File**: %s\n**Score**: %.2f\n```go\n%s\n```\n\n", doc.Symbol, doc.File, doc.FusedScore, doc.Signature)
+					}
+					return textResp(req.ID, out.String())
+				}
+			}
+		}
+
 		return textResp(req.ID, text)
 
 	case "scalpel_list_routes":

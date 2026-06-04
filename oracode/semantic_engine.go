@@ -436,13 +436,22 @@ func (s *SemanticEngine) HybridSearch(query string, topK int, storeType string) 
 	defer s.mu.RUnlock()
 
 	var finalDocs []SemanticDocument
-	for i := 0; i < topK && i < len(fused); i++ {
-		if docID, ok := s.docMeta[fused[i].cid]; ok {
+	for _, hit := range fused {
+		if len(finalDocs) >= topK {
+			break
+		}
+		if docID, ok := s.docMeta[hit.cid]; ok {
 			if doc, exists := s.Documents[docID]; exists {
+				if storeType != "" && doc.Type != storeType {
+					continue
+				}
+				if storeType == "" && doc.Type != "" && doc.Type != "code" {
+					continue
+				}
 				// Inject the exact dimensional scores into the result payload
-				doc.FusedScore = fused[i].score
-				doc.VectorScore = vecScoreMap[fused[i].cid]
-				doc.BM25Score = bm25ScoreMap[fused[i].cid]
+				doc.FusedScore = hit.score
+				doc.VectorScore = vecScoreMap[hit.cid]
+				doc.BM25Score = bm25ScoreMap[hit.cid]
 				doc.IsStale = isWarmingUp
 				finalDocs = append(finalDocs, doc)
 			}

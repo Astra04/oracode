@@ -326,6 +326,27 @@ Show the columns and types for a specific SQL table, extracted from its `CREATE 
 
 ---
 
+
+#### scalpel_semantic_search (Multi-Store Domain Retrieval)
+
+OraCode now segments its vector database into **domain-specific knowledge stores**. Instead of searching a monolithic index where code, API routes, and meeting notes are jumbled together, you can query specialized layers of your architecture. This drastically reduces noise and improves LLM accuracy.
+
+| Arg | Type | Required | Description |
+|---|---|---|---|
+| query | string | ✅ | Natural language query |
+| store | string | | Domain store to query: 'code' (default), 'adr' (architecture decisions), 'route' (API endpoints), 'domain' (domain models), 'schema' (SQL tables) |
+| limit | integer | | Max results (default 5) |
+
+```json
+{
+  "name": "scalpel_semantic_search",
+  "arguments": {
+    "query": "What is the decided approach for cross-module communication in inventory?",
+    "store": "adr",
+    "limit": 3
+  }
+}
+```
 ### Surface Inspection
 
 Use these to get a structured overview of a module's SQL schema, protobuf services, or Vue components without reading individual files.
@@ -512,9 +533,10 @@ CreateInvoice: expected io:wont, actual:will
 
 ---
 
-#### `scalpel_context_packet`
+#### scalpel_context_packet
 
-Assemble everything an agent needs to start working on a task into a single response: module contract, effect modalities, SQL tables, gRPC services, architectural constraints, and recent architecture decisions.
+Assemble everything an agent needs to start working on a task into a single response.
+**IMPORTANT:** This tool is strictly for retrieving context about *known modules and symbols* (it fetches effect modalities, SQL tables, gRPC services, HTTP routes, architectural constraints, and recent architecture decisions). Do **NOT** use this tool to search for new tasks or unfamiliar concepts. To discover where code lives or search for tasks, use `scalpel_semantic_search` or `scalpel_find_string` instead.
 
 Call this **at the start of a task** to orient yourself without making a dozen separate calls.
 
