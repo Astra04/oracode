@@ -101,6 +101,7 @@ func (s *MCPServer) BuildSemanticIndex() {
 				Content:   body,
 				FileHash:  hash,
 				Callers:   callers,
+				Type:      "code",
 			}
 
 			if err := s.semanticEngine.Upsert(doc); err == nil {

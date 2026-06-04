@@ -2896,7 +2896,10 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 			}()
 		}
 
-		results, err := s.semanticEngine.HybridSearch(query, limit)
+				store, _ := params.Arguments["store"].(string)
+		if store == "" { store = "code" } // Default to code if unspecified
+
+		results, err := s.semanticEngine.HybridSearch(query, limit, store)
 		if err != nil {
 			return errResp(req.ID, "Semantic search failed: "+err.Error())
 		}

@@ -33,6 +33,9 @@ type SemanticDocument struct {
 	FileHash  string   `json:"file_hash"`
 	Callers   []string `json:"callers"` // Persisted for BM25 and context
 
+	// Type determines the domain store (e.g. "code", "adr", "route", "domain", "schema")
+	Type string `json:"type,omitempty"`
+
 	// Transient scoring fields for agentic multidimensional reasoning
 	VectorScore float32 `json:"vector_score,omitempty"`
 	BM25Score   float32 `json:"bm25_score,omitempty"`
@@ -376,7 +379,7 @@ func (s *SemanticEngine) rebuildIndices() {
 	}
 }
 
-func (s *SemanticEngine) HybridSearch(query string, topK int) ([]SemanticDocument, error) {
+func (s *SemanticEngine) HybridSearch(query string, topK int, storeType string) ([]SemanticDocument, error) {
 	// Snapshot warmup state before the potentially slow embedding call.
 	isWarmingUp := s.WarmingUp.Load()
 
