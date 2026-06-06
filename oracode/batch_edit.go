@@ -100,6 +100,7 @@ func (s *MCPServer) BatchEdit(patches []BatchPatch, opts BatchEditOptions) (*Bat
 
 	var results []GroupResult
 	var snapshotsAll map[string][]byte // only used if Atomic
+	lineDeltas := make(map[string]int)
 
 	// Helper: rollback all snapshots
 	rollbackAll := func() {
@@ -133,6 +134,17 @@ func (s *MCPServer) BatchEdit(patches []BatchPatch, opts BatchEditOptions) (*Bat
 			continue
 		}
 
+		// Apply line deltas to range_replace patches in this group
+		for i := range coalesced {
+			if coalesced[i].MutationType == "range_replace" {
+				delta := lineDeltas[coalesced[i].File]
+				if delta != 0 && coalesced[i].Block == "" {
+					coalesced[i].StartLine += delta
+					coalesced[i].EndLine += delta
+				}
+			}
+		}
+
 		// Apply the group
 		grpResult, snapshots, err := s.applyGroup(gname, coalesced, opts)
 		if err != nil && opts.Atomic {
@@ -151,6 +163,23 @@ func (s *MCPServer) BatchEdit(patches []BatchPatch, opts BatchEditOptions) (*Bat
 		}
 
 		results = append(results, grpResult)
+
+		if grpResult.Applied {
+			// Update line deltas for future groups
+			for _, p := range coalesced {
+				if p.MutationType == "range_replace" {
+					oldLines := p.EndLine - p.StartLine + 1
+					newLines := strings.Count(p.NewContent, "\n")
+					if p.NewContent != "" {
+						newLines++
+					} else {
+						newLines = 0
+					}
+					lineDeltas[p.File] += newLines - oldLines
+				}
+			}
+		}
+
 		if !grpResult.Applied && opts.StopOnFirstGroupFailure {
 			break
 		}
@@ -190,6 +219,13 @@ func (s *MCPServer) applyGroup(groupName string, patches []BatchPatch, opts Batc
 		}
 		// Create flock for the target file via a sidecar lock file to avoid VSCode editor locking conflicts
 		fl := flock.New(abs + ".oracode.lock")
+		// Clean up orphaned lock files older than 60s
+		if stat, err := os.Stat(abs + ".oracode.lock"); err == nil {
+			if time.Since(stat.ModTime()) > 60*time.Second {
+				os.Remove(abs + ".oracode.lock")
+			}
+		}
+
 		locked, err := fl.TryLockContext(context.Background(), opts.Timeout)
 		if err != nil || !locked {
 			releaseLocks(locks)
@@ -410,6 +446,12 @@ func (s *MCPServer) applyPatch(p BatchPatch, snapshots map[string][]byte) error 
 		return err
 
 	case "range_replace":
+		if p.OldContent == "" {
+			return fmt.Errorf("range_replace requires old_content — call scalpel_get_range first to read current content")
+		}
+		if strings.HasSuffix(p.File, ".go") && p.SymbolAnchor != "" {
+			return fmt.Errorf("use replace_symbol not range_replace when symbol_anchor is known for .go files")
+		}
 		if p.StartLine == 0 && p.EndLine == 0 && p.Block == "" {
 			return fmt.Errorf("range_replace requires start_line and end_line")
 		}
@@ -456,7 +498,30 @@ func (s *MCPServer) applyPatch(p BatchPatch, snapshots map[string][]byte) error 
 		if endLine < len(lines) {
 			newLines = append(newLines, lines[endLine:]...)
 		}
-		return atomicWriteFile(abs, []byte(strings.Join(newLines, "\n")))
+		if err := atomicWriteFile(abs, []byte(strings.Join(newLines, "\n"))); err != nil {
+			return err
+		}
+
+		// Gate B: Post-splice AST validation
+		if strings.HasSuffix(p.File, ".go") {
+			if err := validateGoSyntax(abs); err != nil {
+				return fmt.Errorf("Go syntax error after range_replace: %w", err)
+			}
+		} else if strings.HasSuffix(p.File, ".vue") || strings.HasSuffix(p.File, ".js") || strings.HasSuffix(p.File, ".ts") {
+			lang, ok := DetectOraLanguage(p.File)
+			if ok {
+				cst, err := s.idx.Pool.ParseFile(abs, lang, s.idx.Policy)
+				if err == nil {
+					if cst.HasError() {
+						cst.Release()
+						return fmt.Errorf("Syntax error detected by tree-sitter parser after range_replace")
+					}
+					cst.Release()
+				}
+			}
+		}
+
+		return nil
 
 	case "create_file":
 		if _, err := os.Stat(abs); err == nil {
@@ -551,3 +616,44 @@ func getBool(args map[string]interface{}, key string) bool {
 
 // Ensure sync is imported (used for flock locks).
 var _ = sync.Mutex{}
+
+func (s *MCPServer) validatePatchStructure(patches []BatchPatch) []string {
+	var errs []string
+	for i, p := range patches {
+		if p.File == "" {
+			errs = append(errs, fmt.Sprintf("Patch %d: file is required", i))
+		}
+		switch p.MutationType {
+		case "replace_symbol", "replace_symbol_vue", "add_struct_field", "remove_struct_field":
+			if p.SymbolAnchor == "" {
+				errs = append(errs, fmt.Sprintf("Patch %d on %s: %s requires symbol_anchor", i, p.File, p.MutationType))
+			}
+		case "range_replace":
+			if p.OldContent == "" {
+				errs = append(errs, fmt.Sprintf("Patch %d on %s: range_replace requires old_content", i, p.File))
+			}
+			if strings.HasSuffix(p.File, ".go") && p.SymbolAnchor != "" {
+				errs = append(errs, fmt.Sprintf("Patch %d on %s: use replace_symbol not range_replace when symbol_anchor is known", i, p.File))
+			}
+			if p.StartLine == 0 && p.EndLine == 0 && p.Block == "" {
+				errs = append(errs, fmt.Sprintf("Patch %d on %s: range_replace requires start_line and end_line", i, p.File))
+			}
+		case "add_import_vue", "add_composable_vue", "create_file", "rename_file":
+			if p.NewContent == "" {
+				errs = append(errs, fmt.Sprintf("Patch %d on %s: %s requires new_content", i, p.File, p.MutationType))
+			}
+		case "replace_block":
+			if p.Block == "" {
+				errs = append(errs, fmt.Sprintf("Patch %d on %s: replace_block requires block", i, p.File))
+			}
+		case "vue_inject_directive":
+			if p.Tag == "" {
+				errs = append(errs, fmt.Sprintf("Patch %d on %s: vue_inject_directive requires tag", i, p.File))
+			}
+			if p.Directive == "" {
+				errs = append(errs, fmt.Sprintf("Patch %d on %s: vue_inject_directive requires directive", i, p.File))
+			}
+		}
+	}
+	return errs
+}
