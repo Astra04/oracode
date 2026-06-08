@@ -77,13 +77,31 @@ func (f *FrontendOps) AddImportToVue(file, importPath string) error {
 
 // AddComposableToSetup injects a composable call into the setup() function or <script setup> block.
 func (f *FrontendOps) AddComposableToSetup(file, composableCall string) error {
+	absPath, err := f.idx.Policy.ResolveWorkspacePath(file)
+	if err != nil {
+		return err
+	}
+	src, err := os.ReadFile(absPath)
+	if err != nil {
+		return err
+	}
+
+	isScriptSetup := strings.Contains(string(src), "<script setup")
+
 	return f.modifyVueScript(file, func(content string) (string, error) {
-		// If <script setup> style, just append at top
-		if strings.Contains(content, "<script setup") {
-			return composableCall + ";\n" + content, nil
+		if isScriptSetup {
+			// For script setup, inject the composable after imports, or at the top if no imports
+			lastImport := regexp.MustCompile("(?m)^import .*$")
+			idx := lastImport.FindAllStringIndex(content, -1)
+			if len(idx) == 0 {
+				return composableCall + "\n" + content, nil
+			}
+			pos := idx[len(idx)-1][1]
+			return content[:pos] + "\n\n" + composableCall + content[pos:], nil
 		}
+
 		// Look for export default { setup() { ... } }
-		setupRe := regexp.MustCompile(`setup\s*\(\s*\)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\}`)
+		setupRe := regexp.MustCompile("setup\\s*\\(\\s*\\)\\s*\\{([^}]*(?:\\{[^}]*\\}[^}]*)*)\\}")
 		if setupRe.MatchString(content) {
 			replaced := setupRe.ReplaceAllStringFunc(content, func(match string) string {
 				body := setupRe.FindStringSubmatch(match)[1]
@@ -239,4 +257,27 @@ func findDeclarationEnd(rest string) int {
 		}
 	}
 	return -1
+}
+
+// ReadBlock returns the content of a specific block (template, script, style) from a Vue SFC.
+func (f *FrontendOps) ReadBlock(file, blockName string) (string, error) {
+	absPath, err := f.idx.Policy.ResolveWorkspacePath(file)
+	if err != nil {
+		return "", err
+	}
+	src, err := os.ReadFile(absPath)
+	if err != nil {
+		return "", err
+	}
+	blocks, err := ParseVueSFC(bytes.NewReader(src))
+	if err != nil {
+		return "", err
+	}
+
+	for _, b := range blocks {
+		if b.Tag == blockName {
+			return b.Content, nil
+		}
+	}
+	return "", fmt.Errorf("block '%s' not found in %s", blockName, file)
 }

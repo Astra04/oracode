@@ -1,15 +1,15 @@
 package oracode
 
 import (
+	"crypto/sha256"
+	"net/http"
+	"net/url"
 	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"io"
 	"io/fs"
 	"os"
@@ -72,6 +72,9 @@ type MCPServer struct {
 	initDone               chan struct{}
 	initOnce               sync.Once
 	semanticIndexingActive atomic.Bool
+
+	dryRunLedger   map[string]time.Time
+	dryRunLedgerMu sync.Mutex
 }
 
 func NewMCPServer(idx *Index) *MCPServer {
@@ -213,6 +216,52 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 
 	case "tools/list":
 		tools := []mcpTool{
+
+			// ==================== WATCHDOG INTEGRATION ====================
+			{
+				Name:        "watchdog_errors",
+				Description: "Fetch runtime errors captured by the watchdog system from state.json",
+				InputSchema: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"service": map[string]string{"type": "string", "description": "Optional: 'Main API', 'TX+', 'PocketBase', 'Frontend', 'system'"},
+						"limit":   map[string]interface{}{"type": "integer", "description": "Max results (default 20)"},
+					},
+				},
+			},
+			{
+				Name:        "watchdog_state",
+				Description: "Get full system state: CPU, RAM, Disk, PG, service health, tenant telemetry",
+				InputSchema: map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+			{
+				Name:        "watchdog_supervisor",
+				Description: "Control a supervised service (start, stop, restart)",
+				InputSchema: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"service": map[string]string{"type": "string", "description": "Required: 'Main API', 'TX+', 'PocketBase', 'Frontend'"},
+						"action":  map[string]string{"type": "string", "description": "Required: 'start', 'stop', 'restart'"},
+					},
+					"required": []string{"service", "action"},
+				},
+			},
+			{
+				Name:        "watchdog_logs",
+				Description: "Get recent log lines from a supervised service",
+				InputSchema: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"service": map[string]string{"type": "string", "description": "Required: 'Main API', 'TX+', 'PocketBase', 'Frontend'"},
+						"lines":   map[string]interface{}{"type": "integer", "description": "Optional: default 200, max 2000"},
+					},
+					"required": []string{"service"},
+				},
+			},
+
 			// ==================== PHASE 1: DISCOVERY & ONBOARDING ====================
 			{
 				Name:        "scalpel_context_packet",
@@ -283,45 +332,6 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 				},
 			},
 			{
-				Name:        "scalpel_list_routes",
-				Description: "List all HTTP route registrations found in Go files (supports gin, chi, echo, net/http).",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"path":  map[string]string{"type": "string", "description": "Directory prefix to filter routes by file path"},
-						"limit": map[string]string{"type": "integer", "description": "Max routes to return (default 200)"},
-					},
-				},
-			},
-			{
-				Name:        "scalpel_list_tables",
-				Description: "List every SQL table definition indexed in the workspace (migrations, clean SQL, backups).",
-				InputSchema: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
-			},
-			{
-				Name:        "scalpel_describe_table",
-				Description: "Show the columns, types, and constraints of a specific SQL table from its CREATE TABLE definition.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"table": map[string]string{"type": "string", "description": "Table name (case-insensitive)"},
-						"limit": map[string]string{"type": "integer", "description": "Max matching definitions to return (default 20)"},
-					},
-					"required": []string{"table"},
-				},
-			},
-			{
-				Name:        "scalpel_get_file_symbols",
-				Description: "List all indexed definitions and references for a given file.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"file": map[string]string{"type": "string", "description": "Relative file path"},
-					},
-					"required": []string{"file"},
-				},
-			},
-			{
 				Name:        "scalpel_get_range",
 				Description: "Read a precise line range from a file with line numbers (max 240 lines).",
 				InputSchema: map[string]interface{}{
@@ -332,54 +342,6 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 						"end":   map[string]string{"type": "integer", "description": "End line (defaults to start)"},
 					},
 					"required": []string{"file", "start"},
-				},
-			},
-			{
-				Name:        "scalpel_find_symbol",
-				Description: "Find all definitions of a symbol (function, struct, variable, type) across the workspace.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"name": map[string]string{"type": "string", "description": "Symbol name to find"},
-						"lang": map[string]string{"type": "string", "description": "Filter by language (go, vue, ts, sql)"},
-						"kind": map[string]string{"type": "string", "description": "Filter by kind (definition, reference)"},
-					},
-					"required": []string{"name"},
-				},
-			},
-			{
-				Name:        "scalpel_find_refs",
-				Description: "Find all call sites and usages of a symbol.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"name": map[string]string{"type": "string", "description": "Symbol name to find references for"},
-					},
-					"required": []string{"name"},
-				},
-			},
-			{
-				Name:        "scalpel_get_symbol_context",
-				Description: "Return source lines around a symbol's definition with optional references.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"name":         map[string]string{"type": "string", "description": "Symbol name"},
-						"contextLines": map[string]string{"type": "integer", "description": "Lines of context above/below (default 8, max 40)"},
-						"includeRefs":  map[string]string{"type": "boolean", "description": "Also list all reference sites"},
-					},
-					"required": []string{"name"},
-				},
-			},
-			{
-				Name:        "scalpel_read_symbol",
-				Description: "Read only the body of a function or definition without loading the whole file.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"name": map[string]string{"type": "string", "description": "Symbol name"},
-					},
-					"required": []string{"name"},
 				},
 			},
 			{
@@ -438,19 +400,6 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 
 			// ==================== PHASE 2: ANALYSIS & PLANNING ====================
 			{
-				Name:        "scalpel_prepare_edit_context",
-				Description: "Before modifying a symbol, get its source code (signature + body), reverse call graph (blast radius up to depth 3), and any module-specific constraints.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"file":   map[string]string{"type": "string", "description": "File containing the symbol"},
-						"symbol": map[string]string{"type": "string", "description": "Symbol name to edit"},
-						"module": map[string]string{"type": "string", "description": "Optional module name to attach module summary"},
-					},
-					"required": []string{"file", "symbol"},
-				},
-			},
-			{
 				Name:        "scalpel_effect",
 				Description: "Analyse a function to determine its effect modalities (error, I/O, panic, async, security, resource) so you know if calling it is safe.",
 				InputSchema: map[string]interface{}{
@@ -477,103 +426,8 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 				},
 			},
 			{
-				Name:        "scalpel_blast_radius",
-				Description: "Show the dependents and impacts of a symbol as a reverse call chain tree.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"symbol": map[string]string{"type": "string", "description": "Symbol name"},
-						"depth":  map[string]string{"type": "integer", "description": "How many hops to trace (default 4)"},
-					},
-					"required": []string{"symbol"},
-				},
-			},
-			{
-				Name:        "scalpel_trace_effects",
-				Description: "Trace effect propagation up the call chain from a symbol (shows every caller's modalities).",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"name":  map[string]string{"type": "string", "description": "Starting symbol"},
-						"depth": map[string]string{"type": "integer", "description": "How many hops to trace (default 3)"},
-					},
-					"required": []string{"name"},
-				},
-			},
-			{
-				Name:        "scalpel_graph_version",
-				Description: "Return the version number and build timestamp of the current effect graph. Use to check if the graph is stale.",
-				InputSchema: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
-			},
-			{
-				Name:        "scalpel_effect_modality",
-				Description: "Return effect modalities (error, io, panic, async, security, resource) for a single Go symbol.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"name": map[string]string{"type": "string", "description": "Symbol name"},
-					},
-					"required": []string{"name"},
-				},
-			},
-			{
-				Name:        "scalpel_module_summary",
-				Description: "Return a one-page summary for a module: purpose, routes, tables, edits, and decisions.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"module": map[string]string{"type": "string", "description": "Module name"},
-					},
-					"required": []string{"module"},
-				},
-			},
-			{
-				Name:        "scalpel_module_contracts",
-				Description: "Load and view the contract specification for a given module (expected effect modalities and wiring rules).",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"module": map[string]string{"type": "string", "description": "Module name"},
-					},
-					"required": []string{"module"},
-				},
-			},
-			{
 				Name:        "scalpel_find_violations",
 				Description: "Compare the module's contract against the actual effect graph; reports every symbol where actual behaviour deviates.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"module": map[string]string{"type": "string", "description": "Module name"},
-					},
-					"required": []string{"module"},
-				},
-			},
-			{
-				Name:        "scalpel_schema_surface",
-				Description: "Return SQL schema surface (tables, columns, types) for a module.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"module": map[string]string{"type": "string", "description": "Module name"},
-					},
-					"required": []string{"module"},
-				},
-			},
-			{
-				Name:        "scalpel_proto_surface",
-				Description: "Return protobuf surface (methods, request/response types) for a gRPC service.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"service": map[string]string{"type": "string", "description": "gRPC service name"},
-					},
-					"required": []string{"service"},
-				},
-			},
-			{
-				Name:        "scalpel_vue_surface",
-				Description: "Return Vue SFC risk/binding surface for a module (components, composables, missing cleanup).",
 				InputSchema: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
@@ -586,11 +440,11 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 			// ==================== PHASE 3: SURGICAL EXECUTION ====================
 			{
 				Name:        "scalpel_batch_edit",
-				Description: "Apply multiple file changes atomically with automatic rollback on build failure, returning the exact compiler error with surrounding lines for immediate repair.",
+				Description: "Apply multiple file changes atomically. Supports Vue ops (replace_symbol_vue, add_import_vue, add_composable_vue, vue_inject_directive, replace_block) and Go ops (replace_symbol, add_struct_field, range_replace, create_file). For range_replace in Vue, specifying a block (e.g. 'template') interprets lines relative to that block.",
 				InputSchema: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"patches":                     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}, "description": "List of patches (each has file, group, mutation_type, etc.)"},
+						"patches":                     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}, "description": "List of patches (file, group, mutation_type, block, start_line, end_line, new_content, symbol_anchor, tag, match_attr, directive)"},
 						"dry_run":                     map[string]string{"type": "boolean", "description": "Only preview, don't write"},
 						"atomic":                      map[string]string{"type": "boolean", "description": "Rollback all groups if any fails"},
 						"stop_on_first_group_failure": map[string]string{"type": "boolean", "description": "Stop processing groups after first failure"},
@@ -606,21 +460,6 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 				},
 			},
 			{
-				Name:        "scalpel_patch_symbol_body",
-				Description: "Replace a specific substring inside a function body, validates the new AST, and writes back only if syntactically correct.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"file":       map[string]string{"type": "string", "description": "Relative file path"},
-						"symbol":     map[string]string{"type": "string", "description": "Function name to modify"},
-						"search":     map[string]string{"type": "string", "description": "Exact string block to find inside the body"},
-						"replace":    map[string]string{"type": "string", "description": "Replacement block"},
-						"confidence": map[string]string{"type": "integer", "description": "0-100 rating of how confident you are (recorded in confidence store)"},
-					},
-					"required": []string{"file", "symbol", "search", "replace"},
-				},
-			},
-			{
 				Name:        "scalpel_scaffold",
 				Description: "Generate full feature skeletons (controllers, services, Vue components) from team templates via a JSON manifest.",
 				InputSchema: map[string]interface{}{
@@ -630,45 +469,6 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 						"dry_run":  map[string]string{"type": "boolean", "description": "Only preview, don't write"},
 					},
 					"required": []string{"manifest"},
-				},
-			},
-			{
-				Name:        "scalpel_replace_symbol",
-				Description: "Replace a Go declaration (function, type, var, const) with a supplied declaration snippet.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"file":        map[string]string{"type": "string", "description": "Relative file path"},
-						"name":        map[string]string{"type": "string", "description": "Symbol name to replace"},
-						"replacement": map[string]string{"type": "string", "description": "Full new declaration snippet"},
-					},
-					"required": []string{"file", "name", "replacement"},
-				},
-			},
-			{
-				Name:        "scalpel_add_struct_field",
-				Description: "Append a Go struct field declaration to a named struct.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"file":   map[string]string{"type": "string", "description": "Relative file path"},
-						"struct": map[string]string{"type": "string", "description": "Struct name"},
-						"field":  map[string]string{"type": "string", "description": "Field declaration (e.g., 'ID int `json:\"id\"`')"},
-					},
-					"required": []string{"file", "struct", "field"},
-				},
-			},
-			{
-				Name:        "scalpel_remove_struct_field",
-				Description: "Remove a named field from a Go struct.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"file":   map[string]string{"type": "string", "description": "Relative file path"},
-						"struct": map[string]string{"type": "string", "description": "Struct name"},
-						"field":  map[string]string{"type": "string", "description": "Field name"},
-					},
-					"required": []string{"file", "struct", "field"},
 				},
 			},
 			{
@@ -685,68 +485,6 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 				},
 			},
 			{
-				Name:        "scalpel_replace_symbol_vue",
-				Description: "Replace a Vue/TypeScript symbol (function, const, let) inside a Vue SFC script block using tree-sitter.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"file":        map[string]string{"type": "string", "description": "Relative path to .vue file"},
-						"symbol":      map[string]string{"type": "string", "description": "Symbol name to replace"},
-						"replacement": map[string]string{"type": "string", "description": "New source for that symbol"},
-					},
-					"required": []string{"file", "symbol", "replacement"},
-				},
-			},
-			{
-				Name:        "scalpel_add_import_vue",
-				Description: "Add an ES import statement to a Vue SFC script block.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"file":        map[string]string{"type": "string", "description": "Relative path to .vue file"},
-						"import_path": map[string]string{"type": "string", "description": "Import path (e.g., 'lodash' or '{ ref } from 'vue'')"},
-					},
-					"required": []string{"file", "import_path"},
-				},
-			},
-			{
-				Name:        "scalpel_add_composable_vue",
-				Description: "Inject a composable call into the setup() function or <script setup> block of a Vue SFC.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"file": map[string]string{"type": "string", "description": "Relative path to .vue file"},
-						"call": map[string]string{"type": "string", "description": "Composable call expression, e.g. 'useMyFeature()'"},
-					},
-					"required": []string{"file", "call"},
-				},
-			},
-			{
-				Name:        "scalpel_sfc_replace_block",
-				Description: "Replace only the script, template, or style block in a Vue SFC. Preserves whitespace and indentation.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"file":    map[string]string{"type": "string", "description": "Relative path to .vue file"},
-						"block":   map[string]string{"type": "string", "description": "Which block to replace (script, template, style)"},
-						"content": map[string]string{"type": "string", "description": "New content for the block"},
-					},
-					"required": []string{"file", "block", "content"},
-				},
-			},
-			{
-				Name:        "scalpel_sfc_read_block",
-				Description: "Read a specific block (script, template, style) of a Vue SFC.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"file":  map[string]string{"type": "string", "description": "Relative path to .vue file"},
-						"block": map[string]string{"type": "string", "description": "Block type: script, template, or style"},
-					},
-					"required": []string{"file", "block"},
-				},
-			},
-			{
 				Name:        "scalpel_apply_pattern",
 				Description: "Apply a capture-based structural pattern replacement inside a scope. Supports optional 'block' for Vue SFC offset translation.",
 				InputSchema: map[string]interface{}{
@@ -760,22 +498,6 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 						"dry_run":     map[string]string{"type": "boolean", "description": "Only report matches, don't write"},
 					},
 					"required": []string{"lang", "pattern", "replacement", "scope"},
-				},
-			},
-			{
-				Name:        "scalpel_apply_patch_preview",
-				Description: "Preview unified diff of a range replacement, then optionally apply. Use symbol_anchor to avoid line drift.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"file":          map[string]string{"type": "string", "description": "Relative file path"},
-						"symbol_anchor": map[string]string{"type": "string", "description": "Symbol name to resolve lines dynamically"},
-						"start_line":    map[string]string{"type": "integer", "description": "Start line (1-indexed)"},
-						"end_line":      map[string]string{"type": "integer", "description": "End line"},
-						"new_content":   map[string]string{"type": "string", "description": "New content to replace the range"},
-						"apply":         map[string]string{"type": "boolean", "description": "If true, write the change"},
-					},
-					"required": []string{"file", "new_content"},
 				},
 			},
 			{
@@ -817,40 +539,6 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 						"filter": map[string]string{"type": "string", "description": "all | file:<path> | symbol:<name>"},
 						"limit":  map[string]string{"type": "integer", "description": "Max results (default 10)"},
 					},
-				},
-			},
-			{
-				Name:        "scalpel_recent_edits",
-				Description: "Return the most recent recorded edits across the whole workspace.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"limit": map[string]string{"type": "integer", "description": "Number of edits to return (default 10, max 100)"},
-					},
-				},
-			},
-			{
-				Name:        "scalpel_edits_for_file",
-				Description: "Return recorded edits that touched a specific file.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"file":  map[string]string{"type": "string", "description": "Relative file path"},
-						"limit": map[string]string{"type": "integer", "description": "Max results (default 10)"},
-					},
-					"required": []string{"file"},
-				},
-			},
-			{
-				Name:        "scalpel_edits_for_symbol",
-				Description: "Return recorded edits that mention a specific symbol.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"name":  map[string]string{"type": "string", "description": "Symbol name"},
-						"limit": map[string]string{"type": "integer", "description": "Max results (default 10)"},
-					},
-					"required": []string{"name"},
 				},
 			},
 			{
@@ -908,29 +596,6 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 				},
 			},
 			{
-				Name:        "scalpel_validate_code",
-				Description: "Run all AST-based and regex architectural constraints on a code snippet.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"code":     map[string]string{"type": "string", "description": "Source code to validate"},
-						"language": map[string]string{"type": "string", "description": "Language (go, vue, ts, sql)"},
-					},
-					"required": []string{"code", "language"},
-				},
-			},
-			{
-				Name:        "scalpel_run_policy",
-				Description: "Run AST/pattern policy constraints against Go files in the workspace.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"policy": map[string]string{"type": "string", "description": "Path to policy YAML file"},
-					},
-					"required": []string{"policy"},
-				},
-			},
-			{
 				Name:        "scalpel_trace_error",
 				Description: "Trace a watchdog error ref into the endpoint, call chain, and schema context.",
 				InputSchema: map[string]interface{}{
@@ -976,48 +641,6 @@ func (s *MCPServer) handle(req mcpRequest) mcpResponse {
 					"type": "object",
 					"properties": map[string]interface{}{
 						"component": map[string]string{"type": "string", "description": "Filter by component name (optional)"},
-					},
-				},
-			},
-			{
-				Name:        "scalpel_trace_chain",
-				Description: "Trace a full call chain from an HTTP route down through Go calls and SQL tables.",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"url":    map[string]string{"type": "string", "description": "URL path"},
-						"method": map[string]string{"type": "string", "description": "HTTP method (default ANY)"},
-						"depth":  map[string]string{"type": "integer", "description": "Trace depth (default 4)"},
-					},
-					"required": []string{"url"},
-				},
-			},
-			{
-				Name:        "scalpel_trace_request",
-				Description: "Trace middleware chain and handler for a URL path (shallow trace).",
-				InputSchema: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"url":    map[string]string{"type": "string", "description": "URL path"},
-						"method": map[string]string{"type": "string", "description": "HTTP method (default ANY)"},
-						"limit":  map[string]string{"type": "integer", "description": "Max matches (default 20)"},
-						"depth":  map[string]string{"type": "integer", "description": "Call chain depth (default 1)"},
-					},
-					"required": []string{"url"},
-				},
-			},
-			{
-				Name:        "scalpel_vue_inject_directive",
-				Description: "You are implementing frontend tiering, dynamic approval logic, or feature flags. You need to add a structural directive (like v-if=\"hasTier('enterprise')\") to specific elements across Vue files. Standard text replacement is dangerous and breaks Vue syntax. This tool safely parses the <template> block, finds the exact element (e.g., 'q-btn' with 'action=\"approve\"'), and structurally injects the directive without breaking formatting.",
-				InputSchema: map[string]interface{}{
-					"type":     "object",
-					"required": []string{"file", "tag", "directive"},
-					"properties": map[string]interface{}{
-						"file":       map[string]string{"type": "string", "description": "Path to the .vue file"},
-						"tag":        map[string]string{"type": "string", "description": "The HTML/Vue tag to target (e.g., 'q-btn', 'div', 'ApproveCard')"},
-						"match_attr": map[string]string{"type": "string", "description": "Optional attribute snippet that must exist on the tag to ensure we hit the right one (e.g., 'label=\"Approve\"' or '@click=\"submit\"')"},
-						"directive":  map[string]string{"type": "string", "description": "The exact Vue directive to inject (e.g., 'v-if=\"requiresApproval\"')"},
-						"dry_run":    map[string]string{"type": "boolean", "description": "If true, returns what would change without writing to disk"},
 					},
 				},
 			},
@@ -1141,61 +764,38 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		if name == "" {
 			return errResp(req.ID, "name is required")
 		}
-		syms := s.idx.FindDefinitions(name)
-		if len(syms) == 0 {
-			return textResp(req.ID, fmt.Sprintf("No symbol found: %q", name))
+
+		if kindFilter == "ref" || kindFilter == "references" {
+			refs := s.idx.FindReferences(name)
+			if len(refs) == 0 {
+				return textResp(req.ID, fmt.Sprintf("No references found for %q", name))
+			}
+			out := fmt.Sprintf("## References for '%s' (%d)\n", name, len(refs))
+			for _, ref := range refs {
+				out += fmt.Sprintf("- %s:%d\n", ref.File, ref.Line)
+			}
+			return textResp(req.ID, out)
 		}
-		out := fmt.Sprintf("## Definitions for `%s`\n", name)
-		count := 0
-		for _, sym := range syms {
+
+		s.idx.mu.RLock()
+		var matches []*Symbol
+		for _, sym := range s.idx.Symbols[name] {
 			if langFilter != "" && string(sym.Language) != langFilter {
 				continue
 			}
-			if kindFilter != "" && sym.Kind != kindFilter {
-				continue
-			}
-			out += fmt.Sprintf("- `%s` kind=%s lang=%s → %s:%d\n", sym.Name, sym.Kind, sym.Language, sym.File, sym.Line)
-			count++
+			matches = append(matches, sym)
 		}
-		if count == 0 {
-			return textResp(req.ID, fmt.Sprintf("No symbol found for filters lang=%q kind=%q", langFilter, kindFilter))
-		}
-		return textResp(req.ID, out)
+		s.idx.mu.RUnlock()
 
-	case "scalpel_find_refs":
-		name, _ := params.Arguments["name"].(string)
-		if name == "" {
-			return errResp(req.ID, "name is required")
+		if len(matches) == 0 {
+			return textResp(req.ID, fmt.Sprintf("Symbol %q not found", name))
 		}
-		refs := s.findRefs(name)
-		if len(refs) == 0 {
-			return textResp(req.ID, fmt.Sprintf("No references found for `%s`.", name))
+		var out strings.Builder
+		fmt.Fprintf(&out, "## Definitions for '%s' (%d)\n", name, len(matches))
+		for _, m := range matches {
+			fmt.Fprintf(&out, "- %s:%d (%s)\n", m.File, m.Line, m.Language)
 		}
-		out := fmt.Sprintf("## References to `%s` (%d sites)\n", name, len(refs))
-		for _, r := range refs {
-			out += fmt.Sprintf("- %s:%d (lang=%s)\n", r.File, r.Line, r.Language)
-		}
-		return textResp(req.ID, out)
-
-	case "scalpel_get_symbol_context":
-		name, _ := params.Arguments["name"].(string)
-		if name == "" {
-			return errResp(req.ID, "name is required")
-		}
-		contextLines := intArg(params.Arguments, "contextLines", 8)
-		if contextLines < 0 {
-			contextLines = 0
-		}
-		if contextLines > 40 {
-			contextLines = 40
-		}
-		includeRefs, _ := params.Arguments["includeRefs"].(bool)
-		text, err := s.symbolContext(name, contextLines, includeRefs)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		return textResp(req.ID, text)
-
+		return textResp(req.ID, out.String())
 	case "scalpel_get_range":
 		file, _ := params.Arguments["file"].(string)
 		if file == "" {
@@ -1208,13 +808,6 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 			return errResp(req.ID, err.Error())
 		}
 		return textResp(req.ID, text)
-
-	case "scalpel_get_file_symbols":
-		file, _ := params.Arguments["file"].(string)
-		if file == "" {
-			return errResp(req.ID, "file is required")
-		}
-		return textResp(req.ID, s.fileSymbols(file))
 
 	case "scalpel_dependencies":
 		file, _ := params.Arguments["file"].(string)
@@ -1249,6 +842,41 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		return textResp(req.ID, out)
 
 	case "scalpel_list_tables":
+		tableDesc, _ := params.Arguments["table"].(string)
+		if tableDesc != "" {
+			sqlGraph, err := LoadSQLGraph(workspaceStatePath(s.idx.Policy.WorkspaceRoot, "sql_graph.json"))
+			if err != nil || sqlGraph == nil {
+				return errResp(req.ID, "sql_graph not available")
+			}
+			var matches []TableDef
+			for name, table := range sqlGraph.Tables {
+				if strings.EqualFold(name, tableDesc) {
+					matches = append(matches, table)
+				}
+			}
+			if len(matches) == 0 {
+				return textResp(req.ID, fmt.Sprintf("Table %q not found in graph", tableDesc))
+			}
+			var out strings.Builder
+			for _, t := range matches {
+				fmt.Fprintf(&out, "## Table \x60%s\x60 (Module: %s)\n**File**: %s\n", t.Name, t.Module, t.File)
+				for _, col := range t.Columns {
+					null := ""
+					if col.Nullable {
+						null = "NULL"
+					} else {
+						null = "NOT NULL"
+					}
+					fmt.Fprintf(&out, "- %s %s %s %s\n", col.Name, col.Type, null, col.Key)
+				}
+				for _, fk := range t.ForeignKeys {
+					fmt.Fprintf(&out, "- FOREIGN KEY (%s) REFERENCES %s(%s)\n", fk.Column, fk.RefTable, fk.RefColumn)
+				}
+				out.WriteString("\n")
+			}
+			return textResp(req.ID, out.String())
+		}
+
 		s.idx.mu.RLock()
 		var tables []*Symbol
 		for _, symList := range s.idx.Symbols {
@@ -1265,10 +893,9 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		}
 		out := fmt.Sprintf("## SQL Tables (%d)\n", len(tables))
 		for _, t := range tables {
-			out += fmt.Sprintf("- `%s` → %s:%d\n", t.Name, t.File, t.Line)
+			out += fmt.Sprintf("- \x60%s\x60 → %s:%d\n", t.Name, t.File, t.Line)
 		}
 		return textResp(req.ID, out)
-
 	case "scalpel_reindex":
 		file, _ := params.Arguments["file"].(string)
 		if file != "" {
@@ -1337,66 +964,22 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		if err != nil {
 			return errResp(req.ID, err.Error())
 		}
-		return textResp(req.ID, text)
 
-	case "scalpel_list_routes":
-		pathFilter, _ := params.Arguments["path"].(string)
-		limit := intArg(params.Arguments, "limit", 200)
-		if limit < 1 {
-			limit = 200
+		if strings.Contains(text, "No matches found for") && file == "" && langFilter == "" {
+			// Fallback to semantic search so the tool call doesn't go to waste
+			if s.semanticEngine != nil {
+				semResults, semErr := s.semanticEngine.HybridSearch(query, limit, "code")
+				if semErr == nil && len(semResults) > 0 {
+					var out strings.Builder
+					fmt.Fprintf(&out, "## No exact string matches found. Falling back to Semantic Search Results:\n\n")
+					for _, doc := range semResults {
+						fmt.Fprintf(&out, "### `%s`\n**File**: %s\n**Score**: %.2f\n```go\n%s\n```\n\n", doc.Symbol, doc.File, doc.FusedScore, doc.Signature)
+					}
+					return textResp(req.ID, out.String())
+				}
+			}
 		}
-		if limit > 2000 {
-			limit = 2000
-		}
-		text, err := s.listRoutes(pathFilter, limit)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		return textResp(req.ID, text)
 
-	case "scalpel_trace_request":
-		url, _ := params.Arguments["url"].(string)
-		if strings.TrimSpace(url) == "" {
-			return errResp(req.ID, "url is required")
-		}
-		method, _ := params.Arguments["method"].(string)
-		depth := intArg(params.Arguments, "depth", 1)
-		if depth < 1 {
-			depth = 1
-		}
-		if depth > 5 {
-			depth = 5
-		}
-		limit := intArg(params.Arguments, "limit", 20)
-		if limit < 1 {
-			limit = 20
-		}
-		if limit > 200 {
-			limit = 200
-		}
-		text, err := s.traceRequest(url, method, limit, depth)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		return textResp(req.ID, text)
-
-	case "scalpel_trace_chain":
-		url, _ := params.Arguments["url"].(string)
-		if strings.TrimSpace(url) == "" {
-			return errResp(req.ID, "url is required")
-		}
-		method, _ := params.Arguments["method"].(string)
-		depth := intArg(params.Arguments, "depth", 4)
-		if depth < 1 {
-			depth = 1
-		}
-		if depth > 8 {
-			depth = 8
-		}
-		text, err := s.traceChain(url, method, depth)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
 		return textResp(req.ID, text)
 
 	case "scalpel_rename_symbol":
@@ -1426,6 +1009,109 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		out, _ := json.MarshalIndent(gap, "", "  ")
 		return textResp(req.ID, "## Schema Gap\n```json\n"+string(out)+"\n```")
 
+	case "scalpel_module":
+		view, _ := params.Arguments["view"].(string)
+		module, _ := params.Arguments["module"].(string)
+		if view == "" || module == "" {
+			return errResp(req.ID, "view and module required")
+		}
+
+		if view == "contract" {
+			contractPath := workspaceSourcePath(s.idx.Policy.WorkspaceRoot, "module_contracts", module+".json")
+			data, err := os.ReadFile(contractPath)
+			if err != nil {
+				return errResp(req.ID, fmt.Sprintf("contract for module %q not found: %v", module, err))
+			}
+			return textResp(req.ID, fmt.Sprintf("## Contract for Module: %s\n```json\n%s\n```", module, string(data)))
+		} else if view == "blast" {
+			depthF, ok := params.Arguments["depth"].(float64)
+			depth := 2
+			if ok {
+				depth = int(depthF)
+			}
+			tree, err := s.ReverseChain(module, depth)
+			if err != nil {
+				return errResp(req.ID, err.Error())
+			}
+			report := "## Blast Radius for " + module + "\n" + formatBlastTree(tree, "")
+			return textResp(req.ID, report)
+		}
+
+		// Default to summary
+		summary, err := s.ModuleSummary(module)
+		if err != nil {
+			return errResp(req.ID, err.Error())
+		}
+		outJSON, _ := json.MarshalIndent(summary, "", "  ")
+		return textResp(req.ID, "## Module Summary: " + module + "\n```json\n" + string(outJSON) + "\n```\n")
+
+		case "scalpel_sfc_read_block":
+		file, _ := params.Arguments["file"].(string)
+		block, _ := params.Arguments["block"].(string)
+		if file == "" || block == "" {
+			return errResp(req.ID, "file and block required")
+		}
+		fops := NewFrontendOps(s.idx)
+		content, err := fops.ReadBlock(file, block)
+		if err != nil {
+			return errResp(req.ID, err.Error())
+		}
+		return textResp(req.ID, fmt.Sprintf("## %s (%s)\n\x60\x60\x60vue\n%s\n\x60\x60\x60", file, block, content))
+
+		// ===== WATCHDOG INTEGRATION =====
+	case "watchdog_errors":
+		service, _ := params.Arguments["service"].(string)
+		limitF, ok := params.Arguments["limit"].(float64)
+		limit := 20
+		if ok { limit = int(limitF) }
+
+		res, err := s.fetchWatchdogArtifact("errors.jsonl") // Or state.json if we parse it
+		if err != nil { return errResp(req.ID, err.Error()) }
+
+		// Very simple filter: if service is provided, we just string match for now.
+		// Alternatively, we return state.json and let the user filter.
+		// For robustness, let's just return the raw or lightly processed artifacts.
+		if service != "" {
+			lines := strings.Split(res, "\n")
+			var filtered []string
+			for _, line := range lines {
+				if strings.Contains(line, service) {
+					filtered = append(filtered, line)
+				}
+			}
+			if len(filtered) > limit { filtered = filtered[:limit] }
+			return textResp(req.ID, strings.Join(filtered, "\n"))
+		}
+
+		lines := strings.Split(res, "\n")
+		if len(lines) > limit { lines = lines[:limit] }
+		return textResp(req.ID, strings.Join(lines, "\n"))
+
+	case "watchdog_state":
+		res, err := s.fetchWatchdogArtifact("state.json")
+		if err != nil { return errResp(req.ID, err.Error()) }
+		return textResp(req.ID, res)
+
+	case "watchdog_supervisor":
+		service, _ := params.Arguments["service"].(string)
+		action, _ := params.Arguments["action"].(string)
+		if service == "" || action == "" { return errResp(req.ID, "service and action required") }
+
+		res, err := s.postWatchdogSupervisor(service, action)
+		if err != nil { return errResp(req.ID, err.Error()) }
+		return textResp(req.ID, res)
+
+	case "watchdog_logs":
+		service, _ := params.Arguments["service"].(string)
+		linesF, ok := params.Arguments["lines"].(float64)
+		lines := 200
+		if ok { lines = int(linesF) }
+		if service == "" { return errResp(req.ID, "service required") }
+
+		res, err := s.fetchWatchdogLogs(service, lines)
+		if err != nil { return errResp(req.ID, err.Error()) }
+		return textResp(req.ID, res)
+
 	case "scalpel_trace_error":
 		ref, _ := params.Arguments["ref"].(string)
 		if strings.TrimSpace(ref) == "" {
@@ -1437,30 +1123,6 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		}
 		out, _ := json.MarshalIndent(report, "", "  ")
 		return textResp(req.ID, "## Error Report\n```json\n"+string(out)+"\n```")
-
-	case "scalpel_module_summary":
-		module, _ := params.Arguments["module"].(string)
-		if strings.TrimSpace(module) == "" {
-			return errResp(req.ID, "module required")
-		}
-		summary, err := s.ModuleSummary(module)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		out, _ := json.MarshalIndent(summary, "", "  ")
-		return textResp(req.ID, "## Module Summary\n```json\n"+string(out)+"\n```")
-
-	case "scalpel_blast_radius":
-		symbol, _ := params.Arguments["symbol"].(string)
-		depth := intArg(params.Arguments, "depth", 4)
-		if strings.TrimSpace(symbol) == "" {
-			return errResp(req.ID, "symbol required")
-		}
-		root, err := s.ReverseChain(symbol, depth)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		return textResp(req.ID, "## Blast Radius\n```text\n"+formatBlastTree(root, "")+"```")
 
 	case "scalpel_apply_pattern":
 		lang, _ := params.Arguments["lang"].(string)
@@ -1486,20 +1148,6 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		out, _ := json.MarshalIndent(matches, "", "  ")
 		return textResp(req.ID, fmt.Sprintf("## Pattern Matches (dry run=%v)\n```json\n%s\n```", dryRun, out))
 
-	case "scalpel_run_policy":
-		policyPath, _ := params.Arguments["policy"].(string)
-		if policyPath == "" {
-			return errResp(req.ID, "policy path required")
-		}
-		violations, err := s.idx.RunPolicy(policyPath)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		if len(violations) == 0 {
-			return textResp(req.ID, "Policy passed – no violations found.")
-		}
-		return textResp(req.ID, "## Policy Violations\n"+strings.Join(violations, "\n"))
-
 	case "scalpel_watch_errors":
 		logPath, _ := params.Arguments["log"].(string)
 		limit := intArg(params.Arguments, "limit", 20)
@@ -1518,83 +1166,6 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 			out += fmt.Sprintf("- %s:%d | symbol %q | line: %s\n", m.File, m.LineNum, m.Symbol, m.Line)
 		}
 		return textResp(req.ID, out)
-
-	case "scalpel_describe_table":
-		table, _ := params.Arguments["table"].(string)
-		if strings.TrimSpace(table) == "" {
-			return errResp(req.ID, "table is required")
-		}
-		limit := intArg(params.Arguments, "limit", 20)
-		if limit < 1 {
-			limit = 20
-		}
-		if limit > 100 {
-			limit = 100
-		}
-		text, err := s.describeTable(table, limit)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		return textResp(req.ID, text)
-
-	case "scalpel_recent_edits":
-		if s.store == nil {
-			return errResp(req.ID, "edit store not available")
-		}
-		limit := intArg(params.Arguments, "limit", 10)
-		if limit < 1 {
-			limit = 10
-		}
-		if limit > 100 {
-			limit = 100
-		}
-		edits, err := s.store.RecentEdits(limit)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		return textResp(req.ID, renderEditEntries("Recent Edits", edits))
-
-	case "scalpel_edits_for_file":
-		if s.store == nil {
-			return errResp(req.ID, "edit store not available")
-		}
-		file, _ := params.Arguments["file"].(string)
-		if file == "" {
-			return errResp(req.ID, "file is required")
-		}
-		limit := intArg(params.Arguments, "limit", 10)
-		if limit < 1 {
-			limit = 10
-		}
-		if limit > 100 {
-			limit = 100
-		}
-		edits, err := s.store.EditsForFile(file, limit)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		return textResp(req.ID, renderEditEntries(fmt.Sprintf("Edits for %s", file), edits))
-
-	case "scalpel_edits_for_symbol":
-		if s.store == nil {
-			return errResp(req.ID, "edit store not available")
-		}
-		name, _ := params.Arguments["name"].(string)
-		if name == "" {
-			return errResp(req.ID, "name is required")
-		}
-		limit := intArg(params.Arguments, "limit", 10)
-		if limit < 1 {
-			limit = 10
-		}
-		if limit > 100 {
-			limit = 100
-		}
-		edits, err := s.store.EditsForSymbol(name, limit)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		return textResp(req.ID, renderEditEntries(fmt.Sprintf("Edits for symbol %s", name), edits))
 
 	case "scalpel_record_edit":
 		if s.store == nil {
@@ -1654,216 +1225,6 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		return textResp(req.ID, renderModuleInfo(file, info))
 
 	// ===== PHASE 2: ANALYSIS & PLANNING =====
-	case "scalpel_prepare_edit_context":
-		file, _ := params.Arguments["file"].(string)
-		symbol, _ := params.Arguments["symbol"].(string)
-		module, _ := params.Arguments["module"].(string)
-		depth := intArg(params.Arguments, "depth", 3)
-		if file == "" || symbol == "" {
-			return errResp(req.ID, "file and symbol required")
-		}
-		ctx, err := s.PrepareEditContext(file, symbol, module, depth)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		out, _ := json.MarshalIndent(ctx, "", "  ")
-		return textResp(req.ID, "## Edit Context\n```json\n"+string(out)+"\n```")
-
-	case "scalpel_effect_modality":
-		name, _ := params.Arguments["name"].(string)
-		if name == "" {
-			return errResp(req.ID, "name required")
-		}
-		graph, err := s.idx.GetEffectGraph()
-		if err != nil {
-			return errResp(req.ID, fmt.Sprintf("effect graph error: %v", err))
-		}
-		if graph == nil {
-			return textResp(req.ID, "Effect graph not built yet. Run reindex.")
-		}
-		mod, ok := graph.Symbols[name]
-		if !ok {
-			return textResp(req.ID, fmt.Sprintf("No effect data for symbol %q", name))
-		}
-		out := fmt.Sprintf("## Effect Modalities for `%s`\n", name)
-		out += fmt.Sprintf("- error: %s\n", mod.Error)
-		out += fmt.Sprintf("- io: %s\n", mod.IO)
-		out += fmt.Sprintf("- panic: %s\n", mod.Panic)
-		out += fmt.Sprintf("- async: %s\n", mod.Async)
-		out += fmt.Sprintf("- security: %s\n", mod.Security)
-		out += fmt.Sprintf("- resource: %s\n", mod.Resource)
-		out += fmt.Sprintf("- confidence: %d%%\n", mod.Confidence)
-		out += fmt.Sprintf("\nGraph version: %d, generated: %s\n", graph.Version, graph.Generated.Format(time.RFC3339))
-		return textResp(req.ID, out)
-
-	case "scalpel_graph_version":
-		graph, err := s.idx.GetEffectGraph()
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		if graph == nil {
-			return textResp(req.ID, "No effect graph built yet.")
-		}
-		return textResp(req.ID, fmt.Sprintf("effect_graph version %d (generated %s)", graph.Version, graph.Generated.Format(time.RFC3339)))
-
-	case "scalpel_trace_effects":
-		startSym, _ := params.Arguments["name"].(string)
-		depth := intArg(params.Arguments, "depth", 3)
-		if startSym == "" {
-			return errResp(req.ID, "name required")
-		}
-		text, err := s.traceEffects(startSym, depth)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		return textResp(req.ID, text)
-
-	case "scalpel_read_symbol":
-		name, _ := params.Arguments["name"].(string)
-		if name == "" {
-			return errResp(req.ID, "name required")
-		}
-		defs := s.idx.FindDefinitions(name)
-		if len(defs) == 0 {
-			return textResp(req.ID, fmt.Sprintf("Symbol %q not found", name))
-		}
-		def := defs[0]
-		absPath, err := s.idx.Policy.ResolveWorkspacePath(def.File)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		data, err := os.ReadFile(absPath)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		if def.Language != LanguageGo {
-			snippet, err := s.sourceRange(def.File, def.Line, def.Line+80)
-			if err != nil {
-				return errResp(req.ID, err.Error())
-			}
-			return textResp(req.ID, snippet)
-		}
-		fset := token.NewFileSet()
-		file, err := parser.ParseFile(fset, "", data, 0)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		var fnDecl *ast.FuncDecl
-		ast.Inspect(file, func(n ast.Node) bool {
-			if fn, ok := n.(*ast.FuncDecl); ok && fn.Name.Name == name {
-				fnDecl = fn
-				return false
-			}
-			return true
-		})
-		if fnDecl == nil {
-			snippet, err := s.sourceRange(def.File, def.Line, def.Line+80)
-			if err != nil {
-				return errResp(req.ID, err.Error())
-			}
-			return textResp(req.ID, snippet)
-		}
-		start := fset.Position(fnDecl.Pos()).Line
-		end := fset.Position(fnDecl.End()).Line
-		snippet, err := s.sourceRange(def.File, start, end)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		return textResp(req.ID, snippet)
-
-	case "scalpel_replace_symbol":
-		file, _ := params.Arguments["file"].(string)
-		name, _ := params.Arguments["name"].(string)
-		replacement, _ := params.Arguments["replacement"].(string)
-		if file == "" || name == "" || replacement == "" {
-			return errResp(req.ID, "file, name and replacement required")
-		}
-		if s.ops == nil {
-			return errResp(req.ID, "surgical ops unavailable")
-		}
-		if _, err := s.ops.ReplaceSymbol(file, name, replacement); err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		if err := s.idx.IndexFile(file, LanguageGo); err == nil {
-			_ = s.idx.RefreshRouteGraph()
-			_ = s.idx.buildEffectGraph()
-		}
-		return textResp(req.ID, fmt.Sprintf("Replaced symbol `%s` in %s", name, file))
-
-	case "scalpel_add_struct_field":
-		file, _ := params.Arguments["file"].(string)
-		structName, _ := params.Arguments["struct"].(string)
-		fieldSrc, _ := params.Arguments["field"].(string)
-		if file == "" || structName == "" || fieldSrc == "" {
-			return errResp(req.ID, "file, struct and field required")
-		}
-		if s.ops == nil {
-			return errResp(req.ID, "surgical ops unavailable")
-		}
-		if _, err := s.ops.AddStructField(file, structName, fieldSrc); err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		if err := s.idx.IndexFile(file, LanguageGo); err == nil {
-			_ = s.idx.RefreshRouteGraph()
-			_ = s.idx.buildEffectGraph()
-		}
-		return textResp(req.ID, fmt.Sprintf("Added struct field to %s.%s", file, structName))
-
-	case "scalpel_remove_struct_field":
-		file, _ := params.Arguments["file"].(string)
-		structName, _ := params.Arguments["struct"].(string)
-		fieldName, _ := params.Arguments["field"].(string)
-		if file == "" || structName == "" || fieldName == "" {
-			return errResp(req.ID, "file, struct and field required")
-		}
-		if s.ops == nil {
-			return errResp(req.ID, "surgical ops unavailable")
-		}
-		if _, err := s.ops.RemoveStructField(file, structName, fieldName); err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		if err := s.idx.IndexFile(file, LanguageGo); err == nil {
-			_ = s.idx.RefreshRouteGraph()
-			_ = s.idx.buildEffectGraph()
-		}
-		return textResp(req.ID, fmt.Sprintf("Removed struct field %s from %s.%s", fieldName, file, structName))
-
-	case "scalpel_validate_code":
-		code, _ := params.Arguments["code"].(string)
-		language, _ := params.Arguments["language"].(string)
-		if code == "" || language == "" {
-			return errResp(req.ID, "code and language required")
-		}
-		constraints, err := LoadConstraints(s.idx.Policy.WorkspaceRoot)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		res := ValidateCodeInstrumented(context.Background(), code, language, constraints)
-		if !res.Valid {
-			var msgs []string
-			for _, v := range res.Violations {
-				msgs = append(msgs, fmt.Sprintf("%s: %s", v.ConstraintID, v.Message))
-			}
-			return textResp(req.ID, fmt.Sprintf("Violations:\n%s", strings.Join(msgs, "\n")))
-		}
-		return textResp(req.ID, "No violations")
-
-	case "scalpel_module_contracts":
-		module, _ := params.Arguments["module"].(string)
-		if module == "" {
-			return errResp(req.ID, "module required")
-		}
-		contractPath := workspaceSourcePath(s.idx.Policy.WorkspaceRoot, "module_contracts", module+".json")
-		data, err := os.ReadFile(contractPath)
-		if err != nil {
-			return errResp(req.ID, fmt.Sprintf("contract for module %q not found", module))
-		}
-		var pretty bytes.Buffer
-		if err := json.Indent(&pretty, data, "", "  "); err != nil {
-			return textResp(req.ID, string(data))
-		}
-		return textResp(req.ID, fmt.Sprintf("## Contract for module %s\n```json\n%s\n```", module, pretty.String()))
-
 	case "scalpel_find_violations":
 		module, _ := params.Arguments["module"].(string)
 		if module == "" {
@@ -1960,17 +1321,44 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 			packet.WriteString("\n")
 		}
 
-		sqlGraph, _ := LoadSQLGraph(workspaceStatePath(s.idx.Policy.WorkspaceRoot, "sql_graph.json"))
+				sqlGraph, _ := LoadSQLGraph(workspaceStatePath(s.idx.Policy.WorkspaceRoot, "sql_graph.json"))
 		if sqlGraph != nil {
 			packet.WriteString("## SQL Tables\n")
+			// Deduplicate tables by their column signatures to avoid multi-tenant bloat
+			seenSignatures := make(map[string]string) // sig -> first table name seen
+			printedCount := 0
 			for name, table := range sqlGraph.Tables {
 				if strings.EqualFold(table.Module, module) {
-					fmt.Fprintf(&packet, "- %s (%s)\n", name, table.File)
+					// Create a simple signature based on columns
+					var cols []string
+					for _, c := range table.Columns {
+						cols = append(cols, c.Name+":"+c.Type)
+					}
+					sig := strings.Join(cols, ",")
+
+					if existingTable, exists := seenSignatures[sig]; exists {
+						_ = existingTable
+					} else {
+						seenSignatures[sig] = name
+						fmt.Fprintf(&packet, "- %s (%s)\n", name, table.File)
+						printedCount++
+					}
 				}
+			}
+
+			// To output the missing message: Let's count how many tables belong to the module
+			totalModuleTables := 0
+			for _, table := range sqlGraph.Tables {
+				if strings.EqualFold(table.Module, module) {
+					totalModuleTables++
+				}
+			}
+
+			if totalModuleTables > 0 && printedCount < totalModuleTables {
+				fmt.Fprintf(&packet, "(%d identical tenant table variants omitted to save context space)\n", totalModuleTables-printedCount)
 			}
 			packet.WriteString("\n")
 		}
-
 		protoGraph, _ := LoadProtoGraph(workspaceStatePath(s.idx.Policy.WorkspaceRoot, "proto_graph.json"))
 		if protoGraph != nil {
 			packet.WriteString("## gRPC Services\n")
@@ -2029,136 +1417,6 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 			packet.WriteString("```\n")
 		}
 		return textResp(req.ID, packet.String())
-
-	case "scalpel_schema_surface":
-		module, _ := params.Arguments["module"].(string)
-		if module == "" {
-			return errResp(req.ID, "module required")
-		}
-		graph, err := LoadSQLGraph(workspaceStatePath(s.idx.Policy.WorkspaceRoot, "sql_graph.json"))
-		if err != nil || graph == nil {
-			return errResp(req.ID, "sql_graph not built yet")
-		}
-		var tables []TableDef
-		for _, t := range graph.Tables {
-			if t.Module == module {
-				tables = append(tables, t)
-			}
-		}
-		out, _ := json.MarshalIndent(tables, "", "  ")
-		return textResp(req.ID, fmt.Sprintf("## Schema for module %s\n```json\n%s\n```", module, out))
-
-	case "scalpel_proto_surface":
-		service, _ := params.Arguments["service"].(string)
-		if service == "" {
-			return errResp(req.ID, "service required")
-		}
-		graph, err := LoadProtoGraph(workspaceStatePath(s.idx.Policy.WorkspaceRoot, "proto_graph.json"))
-		if err != nil || graph == nil {
-			return errResp(req.ID, "proto_graph not built yet")
-		}
-		svc, ok := graph.Services[service]
-		if !ok {
-			return textResp(req.ID, fmt.Sprintf("Service %q not found", service))
-		}
-		out, _ := json.MarshalIndent(svc, "", "  ")
-		return textResp(req.ID, fmt.Sprintf("## Service %s\n```json\n%s\n```", service, out))
-
-	case "scalpel_vue_surface":
-		module, _ := params.Arguments["module"].(string)
-		if module == "" {
-			return errResp(req.ID, "module required")
-		}
-		graph, err := LoadVueSurface(workspaceStatePath(s.idx.Policy.WorkspaceRoot, "vue_surface.json"))
-		if err != nil || graph == nil {
-			return errResp(req.ID, "vue_surface not built yet")
-		}
-		var comps []VueComponent
-		for _, c := range graph.Components {
-			if c.Module == module {
-				comps = append(comps, c)
-			}
-		}
-		out, _ := json.MarshalIndent(comps, "", "  ")
-		return textResp(req.ID, fmt.Sprintf("## Vue components for module %s\n```json\n%s\n```", module, out))
-
-	case "scalpel_sfc_read_block":
-		file, _ := params.Arguments["file"].(string)
-		blockType, _ := params.Arguments["block"].(string)
-		if file == "" || blockType == "" {
-			return errResp(req.ID, "file and block required")
-		}
-		absPath, err := s.idx.Policy.ResolveWorkspacePath(file)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		data, err := os.ReadFile(absPath)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		blocks, err := ParseVueSFC(bytes.NewReader(data))
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		for _, block := range blocks {
-			if block.Tag == blockType {
-				out := fmt.Sprintf("## %s block from %s\n```%s\n%s\n```", blockType, file, blockType, block.Content)
-				if blockType == "script" {
-					bindingSurface := extractBindingSurface(data)
-					out += "\n## Binding Surface (template identifiers)\n" + bindingSurface
-				}
-				return textResp(req.ID, out)
-			}
-		}
-		return errResp(req.ID, fmt.Sprintf("block %q not found in %s", blockType, file))
-
-	case "scalpel_sfc_replace_block":
-		file, _ := params.Arguments["file"].(string)
-		blockType, _ := params.Arguments["block"].(string)
-		newContent, _ := params.Arguments["content"].(string)
-		if file == "" || blockType == "" {
-			return errResp(req.ID, "file and block required")
-		}
-		absPath, err := s.idx.Policy.ResolveWorkspacePath(file)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		src, err := os.ReadFile(absPath)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		blocks, err := ParseVueSFC(bytes.NewReader(src))
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		modified := false
-		for i := range blocks {
-			if blocks[i].Tag == blockType {
-				blocks[i].Content = newContent
-				modified = true
-				break
-			}
-		}
-		if !modified {
-			return errResp(req.ID, fmt.Sprintf("block %q not found in %s", blockType, file))
-		}
-		newSource := ReplaceSFCBlocks(src, blocks)
-		cst, err := s.idx.Pool.ParseSource(file, LanguageVue, newSource)
-		if err != nil {
-			return errResp(req.ID, fmt.Sprintf("syntax validation failed for %s: %v", file, err))
-		}
-		defer cst.Release()
-		if cst.HasError() {
-			return errResp(req.ID, fmt.Sprintf("syntax validation failed for %s: parse errors detected", file))
-		}
-		if err := os.WriteFile(absPath, newSource, 0644); err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		lang, _ := DetectOraLanguage(file)
-		if err := s.idx.IndexFile(file, lang); err == nil {
-			_ = s.idx.RefreshRouteGraph()
-		}
-		return textResp(req.ID, fmt.Sprintf("Replaced %s block in %s", blockType, file))
 
 	case "scalpel_git_changes":
 		since, _ := params.Arguments["since"].(string)
@@ -2260,124 +1518,38 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		out, _ := json.MarshalIndent(plan, "", "  ")
 		return textResp(req.ID, fmt.Sprintf("## Edit Plan\n```json\n%s\n```", out))
 
-	case "scalpel_apply_patch_preview":
-		apply, _ := params.Arguments["apply"].(bool)
-		if patchesArg, ok := params.Arguments["patches"].([]interface{}); ok && len(patchesArg) > 0 {
-			var hunks []PatchHunk
-			for _, raw := range patchesArg {
-				patchMap, ok := raw.(map[string]interface{})
-				if !ok {
-					return errResp(req.ID, "invalid patch entry")
-				}
-				hunks = append(hunks, PatchHunk{
-					File:       stringArg(patchMap, "file"),
-					StartLine:  intArg(patchMap, "start_line", 0),
-					EndLine:    intArg(patchMap, "end_line", 0),
-					NewContent: stringArg(patchMap, "new_content"),
-				})
-			}
-			previews, err := s.ApplyPatchPreviewBatch(hunks, apply)
-			if err != nil {
-				return errResp(req.ID, err.Error())
-			}
-			out, _ := json.MarshalIndent(previews, "", "  ")
-			return textResp(req.ID, fmt.Sprintf("## Patch Preview\n```json\n%s\n```", out))
-		}
-
-		file, _ := params.Arguments["file"].(string)
-		start := intArg(params.Arguments, "start_line", 0)
-		end := intArg(params.Arguments, "end_line", 0)
-		newContent, _ := params.Arguments["new_content"].(string)
-		if file == "" || newContent == "" {
-			return errResp(req.ID, "file and new_content required")
-		}
-		if start == 0 || end == 0 {
-			if anchor, ok := params.Arguments["symbol_anchor"].(string); ok && anchor != "" {
-				f, sLine, eLine, err := s.resolveSymbolLocation(anchor)
-				if err == nil {
-					file = f
-					start = sLine
-					end = eLine
-				}
-			}
-		}
-		if start == 0 || end == 0 {
-			return errResp(req.ID, "start_line and end_line required (or symbol_anchor)")
-		}
-		preview, err := s.ApplyPatchPreview(file, start, end, newContent, apply)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		out, _ := json.MarshalIndent(preview, "", "  ")
-		return textResp(req.ID, fmt.Sprintf("## Patch Preview\n```json\n%s\n```", out))
-
-	case "scalpel_replace_symbol_vue":
-		file, _ := params.Arguments["file"].(string)
-		symbol, _ := params.Arguments["symbol"].(string)
-		replacement, _ := params.Arguments["replacement"].(string)
-		if file == "" || symbol == "" || replacement == "" {
-			return errResp(req.ID, "file, symbol and replacement required")
-		}
-		fops := NewFrontendOps(s.idx)
-		if err := fops.ReplaceSymbolInVue(file, symbol, replacement); err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		return textResp(req.ID, fmt.Sprintf("Replaced symbol `%s` in %s", symbol, file))
-
-	case "scalpel_add_import_vue":
-		file, _ := params.Arguments["file"].(string)
-		importPath, _ := params.Arguments["import_path"].(string)
-		if file == "" || importPath == "" {
-			return errResp(req.ID, "file and import_path required")
-		}
-		fops := NewFrontendOps(s.idx)
-		if err := fops.AddImportToVue(file, importPath); err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		return textResp(req.ID, fmt.Sprintf("Added import to %s", file))
-
-	case "scalpel_add_composable_vue":
-		file, _ := params.Arguments["file"].(string)
-		call, _ := params.Arguments["call"].(string)
-		if file == "" || call == "" {
-			return errResp(req.ID, "file and call required")
-		}
-		fops := NewFrontendOps(s.idx)
-		if err := fops.AddComposableToSetup(file, call); err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		return textResp(req.ID, fmt.Sprintf("Added composable call `%s` to %s", call, file))
-
-	// ===== PHASE 3: SURGICAL EXECUTION =====
-	case "scalpel_patch_symbol_body":
-		file, _ := params.Arguments["file"].(string)
-		symbol, _ := params.Arguments["symbol"].(string)
-		search, _ := params.Arguments["search"].(string)
-		replace, _ := params.Arguments["replace"].(string)
-		if file == "" || symbol == "" || search == "" || replace == "" {
-			return errResp(req.ID, "file, symbol, search, replace required")
-		}
-		if s.ops == nil {
-			return errResp(req.ID, "surgical ops unavailable")
-		}
-		result, err := s.ops.PatchSymbolBody(file, symbol, search, replace)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-		if result.Changed {
-			_ = s.idx.IndexFile(file, LanguageGo)
-			_ = s.idx.RefreshRouteGraph()
-		}
-		if confVal, ok := params.Arguments["confidence"].(float64); ok {
-			s.confStore.Record(fmt.Sprintf("patch:%s:%s", file, symbol), int(confVal))
-		}
-		return textResp(req.ID, fmt.Sprintf("Patched body of `%s` in %s", symbol, file))
-
 	case "scalpel_batch_edit":
 		patchesRaw, _ := params.Arguments["patches"].([]interface{})
 		if len(patchesRaw) == 0 {
 			return errResp(req.ID, "patches array is required")
 		}
+
+		// Serialize back to json for hashing
+		rawJSON, _ := json.Marshal(patchesRaw)
+		hashStr := fmt.Sprintf("%x", sha256.Sum256(rawJSON))
+
+		isDryRun := getBool(params.Arguments, "dry_run")
+
+		// Enforce dry_run ledger
+		s.dryRunLedgerMu.Lock()
+		// Cleanup old entries
+		now := time.Now()
+		for k, v := range s.dryRunLedger {
+			if now.Sub(v) > 10*time.Minute {
+				delete(s.dryRunLedger, k)
+			}
+		}
+
+		if isDryRun {
+			s.dryRunLedger[hashStr] = now
+		} else {
+			if _, ok := s.dryRunLedger[hashStr]; !ok {
+				s.dryRunLedgerMu.Unlock()
+				return errResp(req.ID, "batch_edit requires dry_run:true first. Call with dry_run:true, review, then resubmit with dry_run:false exactly as previewed.")
+			}
+		}
+		s.dryRunLedgerMu.Unlock()
+
 		patches := make([]BatchPatch, 0, len(patchesRaw))
 		for _, raw := range patchesRaw {
 			if rawMap, ok := raw.(map[string]interface{}); ok {
@@ -2389,8 +1561,23 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 				patches = append(patches, p)
 			}
 		}
+
+		// Run validatePatchStructure if dry_run
+		if isDryRun {
+			errors := s.validatePatchStructure(patches)
+			if len(errors) > 0 {
+				var out strings.Builder
+				out.WriteString("## Dry Run Patch Structure Validation Failed\n")
+				for _, e := range errors {
+					out.WriteString("- " + e + "\n")
+				}
+				out.WriteString("\nPlease fix these patch parameters before submitting.\n")
+				return textResp(req.ID, out.String())
+			}
+		}
+
 		opts := BatchEditOptions{
-			DryRun:                  getBool(params.Arguments, "dry_run"),
+			DryRun:                  isDryRun,
 			Atomic:                  getBool(params.Arguments, "atomic"),
 			StopOnFirstGroupFailure: getBool(params.Arguments, "stop_on_first_group_failure"),
 			ReadBefore:              getBool(params.Arguments, "read_before"),
@@ -2767,7 +1954,10 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 			}()
 		}
 
-		results, err := s.semanticEngine.HybridSearch(query, limit)
+				store, _ := params.Arguments["store"].(string)
+		if store == "" { store = "code" } // Default to code if unspecified
+
+		results, err := s.semanticEngine.HybridSearch(query, limit, store)
 		if err != nil {
 			return errResp(req.ID, "Semantic search failed: "+err.Error())
 		}
@@ -2816,31 +2006,6 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		return textResp(req.ID, report)
 
 	// ===== VUE DIRECTIVE INJECTION =====
-	case "scalpel_vue_inject_directive":
-		file, _ := params.Arguments["file"].(string)
-		tag, _ := params.Arguments["tag"].(string)
-		matchAttr, _ := params.Arguments["match_attr"].(string)
-		directive, _ := params.Arguments["directive"].(string)
-		dryRun := getBool(params.Arguments, "dry_run")
-
-		if file == "" || tag == "" || directive == "" {
-			return errResp(req.ID, "file, tag, and directive are required")
-		}
-
-		fops := NewFrontendOps(s.idx)
-		if fops == nil {
-			return errResp(req.ID, "frontend operations not available")
-		}
-
-		res, err := fops.InjectVueDirective(file, tag, matchAttr, directive, dryRun)
-		if err != nil {
-			return errResp(req.ID, err.Error())
-		}
-
-		out, _ := json.MarshalIndent(res, "", "  ")
-		return textResp(req.ID, fmt.Sprintf("## Vue Directive Injection Result\n```json\n%s\n```", out))
-
-	// ===== GOVERNANCE =====
 	case "scalpel_read_team_workflow":
 		workflowName, _ := params.Arguments["workflow_name"].(string)
 		workflowsDir := workspaceSourcePath(s.idx.Policy.WorkspaceRoot, "workflows")
@@ -3853,4 +3018,34 @@ func extractBindingSurface(vueSource []byte) string {
 		out = append(out, v)
 	}
 	return strings.Join(out, ", ")
+}
+
+// --- Watchdog Helpers ---
+func (s *MCPServer) fetchWatchdogArtifact(artifact string) (string, error) {
+	resp, err := http.Get(fmt.Sprintf("http://localhost:9191/artifacts/%s", artifact))
+	if err != nil { return "", fmt.Errorf("watchdog API error: %w", err) }
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil { return "", err }
+	return string(b), nil
+}
+
+func (s *MCPServer) postWatchdogSupervisor(service, action string) (string, error) {
+	req, err := http.NewRequest("POST", fmt.Sprintf("http://localhost:9191/api/supervisor/%s/%s", url.PathEscape(service), action), nil)
+	if err != nil { return "", err }
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { return "", fmt.Errorf("watchdog API error: %w", err) }
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil { return "", err }
+	return string(b), nil
+}
+
+func (s *MCPServer) fetchWatchdogLogs(service string, lines int) (string, error) {
+	resp, err := http.Get(fmt.Sprintf("http://localhost:9191/api/logs?service=%s&lines=%d", url.QueryEscape(service), lines))
+	if err != nil { return "", fmt.Errorf("watchdog API error: %w", err) }
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil { return "", err }
+	return string(b), nil
 }

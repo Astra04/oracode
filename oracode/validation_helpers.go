@@ -1,6 +1,8 @@
 package oracode
 
 import (
+	"github.com/odvcencio/gotreesitter"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"go/ast"
@@ -17,9 +19,6 @@ func (s *MCPServer) runValidateOnFiles(files map[string]bool) []string {
 	if err != nil {
 		return []string{fmt.Sprintf("failed to load constraints: %v", err)}
 	}
-	if len(constraints) == 0 {
-		return nil
-	}
 	var violations []string
 	for file := range files {
 		abs, err := s.idx.Policy.ResolveWorkspacePath(file)
@@ -30,13 +29,67 @@ func (s *MCPServer) runValidateOnFiles(files map[string]bool) []string {
 		if err != nil {
 			continue
 		}
+
+		// 1. Language-based constraints
 		lang, ok := DetectOraLanguage(file)
-		if !ok {
-			continue
+		if ok && len(constraints) > 0 {
+			res := ValidateCode(string(src), string(lang), constraints)
+			if len(res) > 0 {
+				violations = append(violations, fmt.Sprintf("%s: %s", file, strings.Join(res, "; ")))
+			}
 		}
-		res := ValidateCode(string(src), string(lang), constraints)
-		if len(res) > 0 {
-			violations = append(violations, fmt.Sprintf("%s: %s", file, strings.Join(res, "; ")))
+
+		// 2. CSS validation (for .css and .vue files)
+		if strings.HasSuffix(file, ".css") {
+			cssViolations := ValidateCSS(string(src), file)
+			for _, v := range cssViolations {
+				violations = append(violations, fmt.Sprintf("%s:%d %s", file, v.Line, v.Message))
+			}
+		} else if strings.HasSuffix(file, ".vue") {
+			blocks, err := ParseVueSFC(bytes.NewReader(src))
+			if err == nil {
+				for _, b := range blocks {
+					if b.Tag == "style" {
+						cssViolations := ValidateCSS(b.Content, file)
+						for _, v := range cssViolations {
+							// line numbers in ValidateCSS will be relative to block content,
+							// we could offset them, but for now just report them.
+							violations = append(violations, fmt.Sprintf("%s (style block):%d %s", file, v.Line, v.Message))
+						}
+					}
+				}
+			}
+		}
+
+		// 3. Tree-sitter syntax check for JS/TS/Vue
+		if ok && (lang == LanguageTypeScript || lang == LanguageJavaScript || lang == LanguageTSX || lang == LanguageVue) {
+			cst, err := s.idx.Pool.ParseFile(abs, lang, s.idx.Policy)
+			if err == nil {
+				if cst.HasError() {
+					// Walk the tree to find the first ERROR node to report line numbers
+					root := cst.Tree.RootNode()
+					if root != nil {
+						var walk func(n *gotreesitter.Node)
+						walk = func(n *gotreesitter.Node) {
+							if n.Type(cst.Tree.Language()) == "ERROR" {
+								startByte := n.StartByte()
+								if startByte > uint32(len(src)) {
+									startByte = uint32(len(src))
+								}
+								line := strings.Count(string(src[:startByte]), "\n") + 1
+								violations = append(violations, fmt.Sprintf("%s:%d syntax error detected by parser", file, line))
+							}
+							for i := 0; i < n.ChildCount(); i++ {
+								walk(n.Child(i))
+							}
+						}
+						walk(root)
+					} else {
+						violations = append(violations, fmt.Sprintf("%s: syntax error detected by parser", file))
+					}
+				}
+				cst.Release()
+			}
 		}
 	}
 	return violations
