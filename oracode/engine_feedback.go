@@ -3,6 +3,7 @@ package oracode
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -19,8 +20,16 @@ type VerificationFailure struct {
 }
 
 func (e *Engine) VerifyWithContext() VerificationFailure {
+	// Try to find the inner directory containing go.mod if it exists
+	buildDir := e.WorkspaceRoot
+	if _, err := os.Stat(filepath.Join(e.WorkspaceRoot, "api", "go.mod")); err == nil {
+		buildDir = filepath.Join(e.WorkspaceRoot, "api")
+	} else if _, err := os.Stat(filepath.Join(e.WorkspaceRoot, "backend", "go.mod")); err == nil {
+		buildDir = filepath.Join(e.WorkspaceRoot, "backend")
+	}
+
 	cmd := exec.Command("go", "build", "./...")
-	cmd.Dir = e.WorkspaceRoot
+	cmd.Dir = buildDir
 	outputBytes, err := cmd.CombinedOutput()
 	output := string(outputBytes)
 

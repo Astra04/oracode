@@ -764,27 +764,38 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		if name == "" {
 			return errResp(req.ID, "name is required")
 		}
-		syms := s.idx.FindDefinitions(name)
-		if len(syms) == 0 {
-			return textResp(req.ID, fmt.Sprintf("No symbol found: %q", name))
+
+		if kindFilter == "ref" || kindFilter == "references" {
+			refs := s.idx.FindReferences(name)
+			if len(refs) == 0 {
+				return textResp(req.ID, fmt.Sprintf("No references found for %q", name))
+			}
+			out := fmt.Sprintf("## References for '%s' (%d)\n", name, len(refs))
+			for _, ref := range refs {
+				out += fmt.Sprintf("- %s:%d\n", ref.File, ref.Line)
+			}
+			return textResp(req.ID, out)
 		}
-		out := fmt.Sprintf("## Definitions for `%s`\n", name)
-		count := 0
-		for _, sym := range syms {
+
+		s.idx.mu.RLock()
+		var matches []*Symbol
+		for _, sym := range s.idx.Symbols[name] {
 			if langFilter != "" && string(sym.Language) != langFilter {
 				continue
 			}
-			if kindFilter != "" && sym.Kind != kindFilter {
-				continue
-			}
-			out += fmt.Sprintf("- `%s` kind=%s lang=%s → %s:%d\n", sym.Name, sym.Kind, sym.Language, sym.File, sym.Line)
-			count++
+			matches = append(matches, sym)
 		}
-		if count == 0 {
-			return textResp(req.ID, fmt.Sprintf("No symbol found for filters lang=%q kind=%q", langFilter, kindFilter))
-		}
-		return textResp(req.ID, out)
+		s.idx.mu.RUnlock()
 
+		if len(matches) == 0 {
+			return textResp(req.ID, fmt.Sprintf("Symbol %q not found", name))
+		}
+		var out strings.Builder
+		fmt.Fprintf(&out, "## Definitions for '%s' (%d)\n", name, len(matches))
+		for _, m := range matches {
+			fmt.Fprintf(&out, "- %s:%d (%s)\n", m.File, m.Line, m.Language)
+		}
+		return textResp(req.ID, out.String())
 	case "scalpel_get_range":
 		file, _ := params.Arguments["file"].(string)
 		if file == "" {
@@ -848,7 +859,7 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 			}
 			var out strings.Builder
 			for _, t := range matches {
-				fmt.Fprintf(&out, "## Table `%s` (Module: %s)\n**File**: %s\n", t.Name, t.Module, t.File)
+				fmt.Fprintf(&out, "## Table \x60%s\x60 (Module: %s)\n**File**: %s\n", t.Name, t.Module, t.File)
 				for _, col := range t.Columns {
 					null := ""
 					if col.Nullable {
@@ -882,10 +893,9 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		}
 		out := fmt.Sprintf("## SQL Tables (%d)\n", len(tables))
 		for _, t := range tables {
-			out += fmt.Sprintf("- `%s` → %s:%d\n", t.Name, t.File, t.Line)
+			out += fmt.Sprintf("- \x60%s\x60 → %s:%d\n", t.Name, t.File, t.Line)
 		}
 		return textResp(req.ID, out)
-
 	case "scalpel_reindex":
 		file, _ := params.Arguments["file"].(string)
 		if file != "" {
@@ -1034,6 +1044,19 @@ func (s *MCPServer) dispatchToolCall(req mcpRequest, toolName string, arguments 
 		}
 		outJSON, _ := json.MarshalIndent(summary, "", "  ")
 		return textResp(req.ID, "## Module Summary: " + module + "\n```json\n" + string(outJSON) + "\n```\n")
+
+		case "scalpel_sfc_read_block":
+		file, _ := params.Arguments["file"].(string)
+		block, _ := params.Arguments["block"].(string)
+		if file == "" || block == "" {
+			return errResp(req.ID, "file and block required")
+		}
+		fops := NewFrontendOps(s.idx)
+		content, err := fops.ReadBlock(file, block)
+		if err != nil {
+			return errResp(req.ID, err.Error())
+		}
+		return textResp(req.ID, fmt.Sprintf("## %s (%s)\n\x60\x60\x60vue\n%s\n\x60\x60\x60", file, block, content))
 
 		// ===== WATCHDOG INTEGRATION =====
 	case "watchdog_errors":

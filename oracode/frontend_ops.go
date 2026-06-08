@@ -258,3 +258,26 @@ func findDeclarationEnd(rest string) int {
 	}
 	return -1
 }
+
+// ReadBlock returns the content of a specific block (template, script, style) from a Vue SFC.
+func (f *FrontendOps) ReadBlock(file, blockName string) (string, error) {
+	absPath, err := f.idx.Policy.ResolveWorkspacePath(file)
+	if err != nil {
+		return "", err
+	}
+	src, err := os.ReadFile(absPath)
+	if err != nil {
+		return "", err
+	}
+	blocks, err := ParseVueSFC(bytes.NewReader(src))
+	if err != nil {
+		return "", err
+	}
+
+	for _, b := range blocks {
+		if b.Tag == blockName {
+			return b.Content, nil
+		}
+	}
+	return "", fmt.Errorf("block '%s' not found in %s", blockName, file)
+}

@@ -25,7 +25,7 @@ func (s *MCPServer) TraceError(ref string) (*TraceErrorReport, error) {
 		return nil, fmt.Errorf("ORACODE_DB_DSN not set")
 	}
 	rows, err := queryPostgresRows(dsn, fmt.Sprintf(
-		`SELECT endpoint, method, error_message FROM system_error_logs WHERE error_ref = %s ORDER BY created_at DESC LIMIT 1`,
+		`SELECT endpoint, method, full_error FROM system_error_logs WHERE error_ref = %s ORDER BY created_at DESC LIMIT 1`,
 		quoteSQLLiteral(ref),
 	))
 	if err != nil {
